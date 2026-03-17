@@ -71,6 +71,9 @@ class MACE(nn.Module):
     ):
         super().__init__()
         self.r_max = r_max
+
+        # Float16 mixed precision: accumulate energy in float32 for stability
+        self._accumulate_float32 = True
         self.max_ell = max_ell
         self.num_interactions = num_interactions
 
@@ -387,14 +390,12 @@ class MACE(nn.Module):
         # 2. Atomic energies (baseline, position-independent)
         node_e0 = self._e0_select_head(
             self.atomic_energies_fn(node_attrs)
-        )  # (num_atoms,)
+        )
 
-        # 3. Node embedding (position-independent, stop_gradient since
-        #    dE/dpositions doesn't need gradients through this branch)
+        # 3. Node embedding
         node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
 
-        # 4. Spherical harmonics in standard m-ordering, then rotate to
-        #    e3nn ordering so that the TP and downstream weights are consistent
+        # 4. Spherical harmonics (rotate to e3nn basis)
         edge_attrs = spherical_harmonics(
             self.max_ell, vectors, normalize=True, normalization="component"
         )
@@ -415,24 +416,24 @@ class MACE(nn.Module):
             node_feats = self.products[i](node_feats, node_attrs, sc=sc)
             node_feats_list.append(node_feats)
 
-        # 7. Readouts — each produces (num_atoms, num_heads), select active head
+        # 7. Readouts
         for i, readout in enumerate(self.readouts):
             feat_idx = -1 if len(self.readouts) == 1 else i
-            # Pass head_idx to NonLinearReadoutBlock for mask_head
             if hasattr(readout, '_num_heads') and readout._num_heads > 1:
                 raw = readout(node_feats_list[feat_idx], head_idx=self._head_idx)
             else:
                 raw = readout(node_feats_list[feat_idx])
-            node_es = self._readout_select_head(raw)  # (num_atoms,)
+            node_es = self._readout_select_head(raw)
             node_energies_list.append(node_es)
 
-        # 8. Accumulate energies — cast to float32 before summing for
-        # numerical stability with FP16/BF16 weights.
-        node_energy = mx.stack(
-            [e.astype(mx.float32) for e in node_energies_list], axis=0
-        ).sum(axis=0)
+        # 8. Accumulate energies
+        if self._accumulate_float32:
+            node_energy = mx.stack(
+                [e.astype(mx.float32) for e in node_energies_list], axis=0
+            ).sum(axis=0)
+        else:
+            node_energy = mx.stack(node_energies_list, axis=0).sum(axis=0)
 
-        # Per-graph energy
         energy = scatter_sum(
             node_energy[:, None], batch, num_graphs
         ).squeeze(-1)
@@ -506,10 +507,13 @@ class MACE(nn.Module):
             node_es = self._readout_select_head(raw)
             node_energies_list.append(node_es)
 
-        # Accumulate energies in float32 for numerical stability
-        node_energy = mx.stack(
-            [e.astype(mx.float32) for e in node_energies_list], axis=0
-        ).sum(axis=0)
+        # Accumulate energies (float32 upcast for numerical stability)
+        if self._accumulate_float32:
+            node_energy = mx.stack(
+                [e.astype(mx.float32) for e in node_energies_list], axis=0
+            ).sum(axis=0)
+        else:
+            node_energy = mx.stack(node_energies_list, axis=0).sum(axis=0)
 
         energy = scatter_sum(
             node_energy[:, None], batch, num_graphs
@@ -570,10 +574,13 @@ class MACE(nn.Module):
             node_es = self._readout_select_head(raw)  # (num_atoms,)
             node_energies_list.append(node_es)
 
-        # Accumulate energies in float32 for numerical stability
-        node_energy = mx.stack(
-            [e.astype(mx.float32) for e in node_energies_list], axis=0
-        ).sum(axis=0)
+        # Accumulate energies (float32 upcast for numerical stability)
+        if self._accumulate_float32:
+            node_energy = mx.stack(
+                [e.astype(mx.float32) for e in node_energies_list], axis=0
+            ).sum(axis=0)
+        else:
+            node_energy = mx.stack(node_energies_list, axis=0).sum(axis=0)
 
         energy = scatter_sum(
             node_energy[:, None], batch, num_graphs
@@ -675,17 +682,24 @@ class ScaleShiftMACE(MACE):
             node_es = self._readout_select_head(raw)
             node_es_list.append(node_es)
 
-        # Scale-shift on interaction energies (accumulate in float32)
-        node_inter_es = mx.stack(
-            [e.astype(mx.float32) for e in node_es_list], axis=0
-        ).sum(axis=0)
+        # Scale-shift on interaction energies
+        if self._accumulate_float32:
+            node_inter_es = mx.stack(
+                [e.astype(mx.float32) for e in node_es_list], axis=0
+            ).sum(axis=0)
+        else:
+            node_inter_es = mx.stack(node_es_list, axis=0).sum(axis=0)
         node_inter_es = self.scale_val * node_inter_es + self.shift_val
 
-        # Total node energy = e0 + scaled interaction (both in float32)
-        node_energy = node_e0.astype(mx.float32) + node_inter_es
+        # Total node energy = e0 + scaled interaction
+        if self._accumulate_float32:
+            node_energy = node_e0.astype(mx.float32) + node_inter_es
+            e0 = scatter_sum(node_e0.astype(mx.float32)[:, None], batch, num_graphs).squeeze(-1)
+        else:
+            node_energy = node_e0 + node_inter_es
+            e0 = scatter_sum(node_e0[:, None], batch, num_graphs).squeeze(-1)
 
         # Per-graph energies
-        e0 = scatter_sum(node_e0.astype(mx.float32)[:, None], batch, num_graphs).squeeze(-1)
         inter_e = scatter_sum(
             node_inter_es[:, None], batch, num_graphs
         ).squeeze(-1)
@@ -718,26 +732,19 @@ class ScaleShiftMACE(MACE):
             positions, edge_index, shifts, cell
         )
 
-        # 2. Node embedding
         node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
-
-        # 3. Spherical harmonics (rotate to e3nn basis)
         edge_attrs = spherical_harmonics(
             self.max_ell, vectors, normalize=True, normalization="component"
         )
         edge_attrs = edge_attrs @ self._sh_rotation
-
-        # 4. Radial embedding
         edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
-
-        # 5. Core forward (interactions + readouts + scale-shift)
-        _, _, total_energy, node_energy, inter_e = self._ss_forward_core(
-            node_attrs, node_feats, edge_attrs, edge_feats, edge_index, batch, num_graphs,
-            cutoff=cutoff,
+        _, _, energy, node_energy, inter_e = self._ss_forward_core(
+            node_attrs, node_feats, edge_attrs, edge_feats, edge_index,
+            batch, num_graphs, cutoff=cutoff,
         )
 
         return {
-            "energy": total_energy,
+            "energy": energy,
             "node_energy": node_energy,
             "interaction_energy": inter_e,
         }

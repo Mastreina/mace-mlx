@@ -206,7 +206,7 @@ class RealAgnosticInteractionBlock(nn.Module):
             message = gather_tp_scatter(
                 node_feats_up, tp_weights, edge_attrs[:, 0],
                 sender, receiver, num_nodes,
-                use_metal=True,
+                use_metal=False,
             )
         else:
             # Standard path: gather -> TP -> scatter
@@ -333,7 +333,7 @@ class RealAgnosticResidualInteractionBlock(nn.Module):
             message = gather_tp_scatter(
                 node_feats_up, tp_weights, edge_attrs[:, 0],
                 sender, receiver, num_nodes,
-                use_metal=True,
+                use_metal=False,
             )
         else:
             # Standard path: gather -> TP -> scatter
@@ -450,7 +450,7 @@ class RealAgnosticDensityInteractionBlock(nn.Module):
             message = gather_tp_scatter(
                 node_feats_up, tp_weights, edge_attrs[:, 0],
                 sender, receiver, num_nodes,
-                use_metal=True,
+                use_metal=False,
             )
         else:
             mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
@@ -573,7 +573,7 @@ class RealAgnosticDensityResidualInteractionBlock(nn.Module):
             message = gather_tp_scatter(
                 node_feats_up, tp_weights, edge_attrs[:, 0],
                 sender, receiver, num_nodes,
-                use_metal=True,
+                use_metal=False,
             )
         else:
             mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
@@ -834,6 +834,7 @@ class RealAgnosticResidualNonLinearInteractionBlock(nn.Module):
 
         # linear_2: post-nonlinearity projection
         self.linear_2 = EquivariantLinear(self.irreps_out, self.irreps_out)
+
 
     def __call__(
         self,

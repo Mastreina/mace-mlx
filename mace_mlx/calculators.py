@@ -95,6 +95,12 @@ class MACEMLXCalculator(Calculator):
         self.z_table: list[int] = getattr(self.model, "z_table", None)
         self._compute_dtype = getattr(self.model, "_compute_dtype", mx.float32)
 
+        # Precompute z -> index mapping for fast one-hot encoding
+        if self.z_table is not None:
+            self._z_to_idx = {int(z): i for i, z in enumerate(self.z_table)}
+        else:
+            self._z_to_idx = None
+
         # Neighbor list cache
         self._skin = skin
         self._nl_cache: dict | None = None
@@ -103,10 +109,20 @@ class MACEMLXCalculator(Calculator):
         self._cache_pbc: np.ndarray | None = None
         self._cache_natoms: int = 0
 
+        # Cached numpy edge arrays (reused when NL cache hits)
+        self._cached_edge_index_np: np.ndarray | None = None
+        self._cached_shifts_np: np.ndarray | None = None
+
+        # Cached batch MLX array (reused when num_atoms matches)
+        self._cached_batch_mx: mx.array | None = None
+
         if device == "cpu":
             mx.set_default_device(mx.cpu)
         else:
             mx.set_default_device(mx.gpu)
+
+        # Enable fused gather-TP-scatter (autograd-safe pure-MLX path)
+        self.model.set_fused_kernel(True)
 
     # ------------------------------------------------------------------ #
     # Model resolution
@@ -181,6 +197,9 @@ class MACEMLXCalculator(Calculator):
             self._cache_cell = np.array(atoms.cell, dtype=np.float64)
             self._cache_pbc = atoms.pbc.copy()
             self._cache_natoms = len(atoms)
+            # Recompute derived numpy arrays when NL is rebuilt
+            self._cached_edge_index_np = np.stack([edge_src, edge_dst]).astype(np.int32)
+            self._cached_shifts_np = shifts.astype(np.float32)
         return (
             self._nl_cache["edge_src"],
             self._nl_cache["edge_dst"],
@@ -202,23 +221,23 @@ class MACEMLXCalculator(Calculator):
 
         # -- Neighbor list ------------------------------------------------
         edge_src, edge_dst, shifts_frac = self._get_neighbor_list(atoms)
-        edge_index_np = np.stack([edge_src, edge_dst]).astype(np.int32)
-        shifts_np = shifts_frac.astype(np.float32)
+        edge_index_np = self._cached_edge_index_np
+        shifts_np = self._cached_shifts_np
 
         # -- One-hot node attributes --------------------------------------
         atomic_numbers = atoms.get_atomic_numbers()
         num_atoms = len(atomic_numbers)
 
-        if self.z_table is not None:
+        if self._z_to_idx is not None:
             num_elements = len(self.z_table)
-            z_to_idx = {z: i for i, z in enumerate(self.z_table)}
+            z_to_idx = self._z_to_idx
         else:
             # Fallback: treat atomic numbers directly as element indices
             num_elements = int(getattr(self.model, "num_elements", 89))
             z_to_idx = {z: z for z in range(num_elements)}
 
-        node_attrs_np = np.zeros((num_atoms, num_elements), dtype=np.float32)
-        for i, z in enumerate(atomic_numbers):
+        # Validate all z values upfront
+        for z in atomic_numbers:
             z_int = int(z)
             if z_int not in z_to_idx:
                 import ase.data
@@ -227,7 +246,9 @@ class MACEMLXCalculator(Calculator):
                     f"is not supported by this model. "
                     f"Supported: {sorted(z_to_idx.keys())}"
                 )
-            node_attrs_np[i, z_to_idx[z_int]] = 1.0
+        indices = np.array([z_to_idx[int(z)] for z in atomic_numbers], dtype=np.int32)
+        node_attrs_np = np.zeros((num_atoms, num_elements), dtype=np.float32)
+        node_attrs_np[np.arange(num_atoms), indices] = 1.0
 
         # -- Convert to mx.array ------------------------------------------
         # Positions always float32 for accurate force gradients via autograd.
@@ -241,7 +262,9 @@ class MACEMLXCalculator(Calculator):
         has_cell = atoms.cell.rank > 0
         cell_mx = mx.array(cell_np).astype(self._compute_dtype) if has_cell else None
 
-        batch_mx = mx.zeros(num_atoms, dtype=mx.int32)
+        if self._cached_batch_mx is None or self._cached_batch_mx.shape[0] != num_atoms:
+            self._cached_batch_mx = mx.zeros(num_atoms, dtype=mx.int32)
+        batch_mx = self._cached_batch_mx
 
         # -- Determine whether to compute stress ----------------------------
         compute_stress = "stress" in (properties or self.implemented_properties)
@@ -293,6 +316,15 @@ class MACEMLXCalculator(Calculator):
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Compute energy (scalar), forces (num_atoms, 3), and node_energy via value_and_grad."""
         compute_dtype = self._compute_dtype
+
+        # Stop gradient on non-position inputs to reduce autograd graph cost
+        node_attrs = mx.stop_gradient(node_attrs)
+        edge_index = mx.stop_gradient(edge_index)
+        shifts = mx.stop_gradient(shifts)
+        if cell is not None:
+            cell = mx.stop_gradient(cell)
+        batch = mx.stop_gradient(batch)
+
         # Mutable container to capture node_energy from the forward pass
         captured = {}
 
@@ -342,6 +374,15 @@ class MACEMLXCalculator(Calculator):
         """
         model = self.model
         compute_dtype = self._compute_dtype
+
+        # Stop gradient on non-position inputs to reduce autograd graph cost
+        node_attrs = mx.stop_gradient(node_attrs)
+        edge_index = mx.stop_gradient(edge_index)
+        shifts = mx.stop_gradient(shifts)
+        if cell is not None:
+            cell = mx.stop_gradient(cell)
+        batch = mx.stop_gradient(batch)
+
         # Mutable container to capture node_energy from the forward pass
         captured = {}
 

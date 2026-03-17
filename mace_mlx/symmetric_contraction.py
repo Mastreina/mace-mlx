@@ -74,6 +74,10 @@ class Contraction(nn.Module):
 
     This contracts k (parameter dim, typically 23-51) before i (coupling dim,
     typically 16), producing smaller intermediates than the i-first approach.
+
+    For correlation <= 4 (the common MACE configurations), an unrolled fast
+    path eliminates the Python loop and per-iteration method call overhead.
+    Pre-transposed weight reshape matrices avoid a transpose per iteration.
     """
 
     def __init__(
@@ -180,6 +184,24 @@ class Contraction(nn.Module):
             if not self._path_weights[nu - 1]:
                 self.weights[i] = mx.zeros_like(self.weights[i])
 
+        # --- Unrolled fast path setup for correlation <= 4 ---
+        # Eliminates the Python loop and per-iteration method call overhead.
+        # Pre-transpose U matrices to (k, prefix) so we avoid U_2d.T each call.
+        self._use_unrolled = correlation <= 4
+        if self._use_unrolled:
+            n_lower = correlation - 1
+            self._u_lower_2d_t = [
+                mx.stop_gradient(u.T) for u in self._u_lower_2d
+            ]
+            # Pre-compute per-iteration shape constants as plain Python ints
+            self._unrolled_lower_prefix_sizes = []
+            self._unrolled_lower_i_dims = []
+            for idx in range(n_lower):
+                pshape = self._u_lower_prefix_shapes[idx]
+                self._unrolled_lower_prefix_sizes.append(math.prod(pshape))
+                self._unrolled_lower_i_dims.append(pshape[-1])
+            self._unrolled_n_lower = n_lower
+
     def set_dtype(self, dtype, predicate=None):
         """Override to also convert U matrices (private attrs excluded by default)."""
         super().set_dtype(dtype, predicate)
@@ -189,6 +211,8 @@ class Contraction(nn.Module):
         self._u_lower_2d = [u.astype(dtype) for u in self._u_lower_2d]
         for nu, u in self._u_matrices.items():
             self._u_matrices[nu] = u.astype(dtype)
+        if self._use_unrolled:
+            self._u_lower_2d_t = [u.astype(dtype) for u in self._u_lower_2d_t]
 
     def __call__(self, features: mx.array, element_onehot: mx.array) -> mx.array:
         """Forward pass: recursive contraction using matmul decomposition.
@@ -200,21 +224,82 @@ class Contraction(nn.Module):
         Returns:
             (batch, num_features * ir_out.dim) contracted features
         """
+        if self._use_unrolled:
+            return self._call_unrolled(features, element_onehot)
+        return self._call_loop(features, element_onehot)
+
+    def _call_loop(self, features: mx.array, element_onehot: mx.array) -> mx.array:
+        """Fallback loop-based forward pass for correlation > 4."""
         b, num_c, coupling_i = features.shape
 
-        # Step 1: Highest correlation order
-        # Original: einsum("...ik,ekc,bci,be->bc...", U, W, features, onehot)
-        # Decomposed into: features @ U_2d, then contract with W_sel
         out = self._contract_main(features, element_onehot, b, num_c)
 
-        # Steps 2..correlation: lower orders, accumulate
         for i in range(len(self._lower_eqs)):
-            # Weight contraction: einsum("...k,ekc,be->bc...", U, W, onehot)
             c_tensor = self._contract_weight(i, element_onehot, b, num_c)
             c_tensor = c_tensor + out
-
-            # Feature contraction: einsum("bc...i,bci->bc...", c_tensor, features)
             out = self._contract_features(c_tensor, features, b, num_c)
+
+        return out.reshape(b, -1)
+
+    def _call_unrolled(self, features: mx.array, element_onehot: mx.array) -> mx.array:
+        """Unrolled fast path for correlation <= 4.
+
+        Eliminates the Python loop by inlining all iterations. Each iteration:
+          1. Select weights by element: (b, e) @ (e, c*k) -> (b, c, k)
+          2. Contract with U:           (b, c, k) @ (k, prefix) -> (b, c, prefix)
+          3. Add accumulated out
+          4. Contract with features:    (b, c, prefix', i) @ (b, c, i, 1)
+
+        Uses pre-transposed U matrices and pre-computed shapes to minimize
+        per-call overhead. Weight selection produces (b, c, k) directly by
+        reshaping W as (e, c, k) -> (e, c*k) so no post-transpose is needed.
+        """
+        b, num_c, coupling_i = features.shape
+        n_lower = self._unrolled_n_lower
+
+        # --- Main contraction (highest correlation order) ---
+        # Merged select+transpose: W (e,k,c) -> transpose -> (e,c,k) -> (e,c*k)
+        # then (b,e) @ (e,c*k) -> (b,c*k) -> (b,c,k)
+        e_m, k_m, c_m = self.weights_max.shape
+        W_max_ck = mx.transpose(self.weights_max, axes=(0, 2, 1)).reshape(
+            e_m, c_m * k_m
+        )
+        W_sel_ck = (element_onehot @ W_max_ck).reshape(b, num_c, k_m)
+
+        # Contract k with U: (b,c,k) @ (k, prefix*i) -> (b,c,prefix,i)
+        prefix_size = self._u_main_prefix_size
+        i_dim = self._u_main_i_dim
+        WU = (W_sel_ck @ self._u_main_wf).reshape(b, num_c, prefix_size, i_dim)
+
+        # Contract i with features: (b,c,prefix,i) @ (b,c,i,1) -> (b,c,prefix)
+        feat_col = features[:, :, :, None]  # computed once, reused below
+        out = (WU @ feat_col).reshape(b, num_c, prefix_size)
+
+        # --- Lower-order iterations (unrolled) ---
+        u_lower_t = self._u_lower_2d_t
+        lower_prefix_sizes = self._unrolled_lower_prefix_sizes
+        lower_i_dims = self._unrolled_lower_i_dims
+
+        for idx in range(n_lower):
+            W_i = self.weights[idx]
+            e_i, k_i, c_i = W_i.shape
+
+            # Select weights: (b,e) @ (e, c*k) -> (b, c, k)
+            W_i_ck = mx.transpose(W_i, axes=(0, 2, 1)).reshape(e_i, c_i * k_i)
+            W_sel_i = (element_onehot @ W_i_ck).reshape(b, num_c, k_i)
+
+            # Contract with U: (b,c,k) @ (k, prefix) -> (b,c,prefix)
+            c_tensor = W_sel_i @ u_lower_t[idx]
+
+            # Add accumulated result
+            c_tensor = c_tensor + out
+
+            # Contract with features:
+            # (b,c,prefix_outer,i_d) @ (b,c,i_d,1) -> (b,c,prefix_outer)
+            i_d = lower_i_dims[idx]
+            prefix_outer = lower_prefix_sizes[idx] // i_d
+            c_4d = c_tensor.reshape(b, num_c, prefix_outer, i_d)
+            out = (c_4d @ feat_col).reshape(b, num_c, prefix_outer)
 
         return out.reshape(b, -1)
 
