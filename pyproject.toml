@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mace-mlx"
+version = "0.1.0"
+description = "GPU-accelerated MACE interatomic potential inference on Apple Silicon via MLX"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["machine-learning", "molecular-dynamics", "interatomic-potentials", "apple-silicon", "mlx", "mace"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "mlx>=0.22.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "ase>=3.22.0",
+    "matscipy>=0.8.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "mace-torch>=0.3.0",
+    "e3nn==0.4.4",
+    "torch>=2.0",
+]
+dev = [
+    "mace-mlx[test]",
+]
+
+[project.urls]
+Homepage = "https://github.com/ACEsuit/mace-mlx"
+Repository = "https://github.com/ACEsuit/mace-mlx"
+Issues = "https://github.com/ACEsuit/mace-mlx/issues"
+
+[tool.setuptools.packages.find]
+include = ["mace_mlx*"]
+
+[tool.setuptools.package-data]
+mace_mlx = ["py.typed"]
+
+[tool.pytest.ini_options]
+markers = [
+    "benchmark: performance benchmark tests (deselect with '-m not benchmark')",
+]
