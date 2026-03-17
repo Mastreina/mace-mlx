@@ -46,7 +46,7 @@ ASE and matscipy are included as core dependencies.
 
 For development:
 ```bash
-git clone https://github.com/ACEsuit/mace-mlx
+git clone https://github.com/Mastreina/mace-mlx
 cd mace-mlx
 pip install -e ".[dev]"
 ```

@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ACEsuit/mace-mlx"
-Repository = "https://github.com/ACEsuit/mace-mlx"
-Issues = "https://github.com/ACEsuit/mace-mlx/issues"
+Homepage = "https://github.com/Mastreina/mace-mlx"
+Repository = "https://github.com/Mastreina/mace-mlx"
+Issues = "https://github.com/Mastreina/mace-mlx/issues"
 
 [tool.setuptools.packages.find]
 include = ["mace_mlx*"]
