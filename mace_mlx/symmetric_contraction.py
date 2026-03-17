@@ -202,6 +202,32 @@ class Contraction(nn.Module):
                 self._unrolled_lower_i_dims.append(pshape[-1])
             self._unrolled_n_lower = n_lower
 
+            # Weight cache state (lazy recompute on id change)
+            self._W_max_ck = None
+            self._W_lower_ck = None
+            self._cached_wmax_id = None
+            self._cached_wlower_ids = None
+
+    def _ensure_weight_caches(self):
+        """Lazily recompute pre-transposed+reshaped weight caches when weights change."""
+        wmax_id = id(self.weights_max)
+        wlower_ids = tuple(id(w) for w in self.weights)
+        if wmax_id == self._cached_wmax_id and wlower_ids == self._cached_wlower_ids:
+            return
+        e_m, k_m, c_m = self.weights_max.shape
+        self._W_max_ck = mx.transpose(self.weights_max, axes=(0, 2, 1)).reshape(
+            e_m, c_m * k_m
+        )
+        self._W_lower_ck = []
+        for idx in range(self._unrolled_n_lower):
+            W_i = self.weights[idx]
+            e_i, k_i, c_i = W_i.shape
+            self._W_lower_ck.append(
+                mx.transpose(W_i, axes=(0, 2, 1)).reshape(e_i, c_i * k_i)
+            )
+        self._cached_wmax_id = wmax_id
+        self._cached_wlower_ids = wlower_ids
+
     def set_dtype(self, dtype, predicate=None):
         """Override to also convert U matrices (private attrs excluded by default)."""
         super().set_dtype(dtype, predicate)
@@ -213,6 +239,8 @@ class Contraction(nn.Module):
             self._u_matrices[nu] = u.astype(dtype)
         if self._use_unrolled:
             self._u_lower_2d_t = [u.astype(dtype) for u in self._u_lower_2d_t]
+            # Invalidate weight caches so they are recomputed on next call
+            self._cached_wmax_id = None
 
     def __call__(self, features: mx.array, element_onehot: mx.array) -> mx.array:
         """Forward pass: recursive contraction using matmul decomposition.
@@ -242,9 +270,9 @@ class Contraction(nn.Module):
         return out.reshape(b, -1)
 
     def _call_unrolled(self, features: mx.array, element_onehot: mx.array) -> mx.array:
-        """Unrolled fast path for correlation <= 4.
+        """Optimized path with pre-transposed U matrices and merged weight selection.
 
-        Eliminates the Python loop by inlining all iterations. Each iteration:
+        Fast path for correlation <= 4. Each iteration:
           1. Select weights by element: (b, e) @ (e, c*k) -> (b, c, k)
           2. Contract with U:           (b, c, k) @ (k, prefix) -> (b, c, prefix)
           3. Add accumulated out
@@ -254,17 +282,15 @@ class Contraction(nn.Module):
         per-call overhead. Weight selection produces (b, c, k) directly by
         reshaping W as (e, c, k) -> (e, c*k) so no post-transpose is needed.
         """
+        self._ensure_weight_caches()
         b, num_c, coupling_i = features.shape
         n_lower = self._unrolled_n_lower
 
         # --- Main contraction (highest correlation order) ---
-        # Merged select+transpose: W (e,k,c) -> transpose -> (e,c,k) -> (e,c*k)
-        # then (b,e) @ (e,c*k) -> (b,c*k) -> (b,c,k)
-        e_m, k_m, c_m = self.weights_max.shape
-        W_max_ck = mx.transpose(self.weights_max, axes=(0, 2, 1)).reshape(
-            e_m, c_m * k_m
-        )
-        W_sel_ck = (element_onehot @ W_max_ck).reshape(b, num_c, k_m)
+        # Use pre-transposed+reshaped weights: (e, c*k)
+        # (b,e) @ (e,c*k) -> (b,c*k) -> (b,c,k)
+        k_m = self.weights_max.shape[1]
+        W_sel_ck = (element_onehot @ self._W_max_ck).reshape(b, num_c, k_m)
 
         # Contract k with U: (b,c,k) @ (k, prefix*i) -> (b,c,prefix,i)
         prefix_size = self._u_main_prefix_size
@@ -281,12 +307,10 @@ class Contraction(nn.Module):
         lower_i_dims = self._unrolled_lower_i_dims
 
         for idx in range(n_lower):
-            W_i = self.weights[idx]
-            e_i, k_i, c_i = W_i.shape
+            k_i = self.weights[idx].shape[1]
 
-            # Select weights: (b,e) @ (e, c*k) -> (b, c, k)
-            W_i_ck = mx.transpose(W_i, axes=(0, 2, 1)).reshape(e_i, c_i * k_i)
-            W_sel_i = (element_onehot @ W_i_ck).reshape(b, num_c, k_i)
+            # Select weights using pre-transposed: (b,e) @ (e, c*k) -> (b, c, k)
+            W_sel_i = (element_onehot @ self._W_lower_ck[idx]).reshape(b, num_c, k_i)
 
             # Contract with U: (b,c,k) @ (k, prefix) -> (b,c,prefix)
             c_tensor = W_sel_i @ u_lower_t[idx]

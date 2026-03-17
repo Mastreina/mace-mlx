@@ -99,7 +99,8 @@ class MACEMLXCalculator(Calculator):
         if self.z_table is not None:
             self._z_to_idx = {int(z): i for i, z in enumerate(self.z_table)}
         else:
-            self._z_to_idx = None
+            num_elements = int(getattr(self.model, "num_elements", 89))
+            self._z_to_idx = {z: z for z in range(num_elements)}
 
         # Neighbor list cache
         self._skin = skin
@@ -123,6 +124,17 @@ class MACEMLXCalculator(Calculator):
 
         # Enable fused gather-TP-scatter (autograd-safe pure-MLX path)
         self.model.set_fused_kernel(True)
+
+    @staticmethod
+    def _stop_grad_inputs(node_attrs, edge_index, shifts, cell, batch):
+        """Apply stop_gradient to non-position inputs."""
+        node_attrs = mx.stop_gradient(node_attrs)
+        edge_index = mx.stop_gradient(edge_index)
+        shifts = mx.stop_gradient(shifts)
+        if cell is not None:
+            cell = mx.stop_gradient(cell)
+        batch = mx.stop_gradient(batch)
+        return node_attrs, edge_index, shifts, cell, batch
 
     # ------------------------------------------------------------------ #
     # Model resolution
@@ -228,13 +240,11 @@ class MACEMLXCalculator(Calculator):
         atomic_numbers = atoms.get_atomic_numbers()
         num_atoms = len(atomic_numbers)
 
-        if self._z_to_idx is not None:
+        if self.z_table is not None:
             num_elements = len(self.z_table)
-            z_to_idx = self._z_to_idx
         else:
-            # Fallback: treat atomic numbers directly as element indices
             num_elements = int(getattr(self.model, "num_elements", 89))
-            z_to_idx = {z: z for z in range(num_elements)}
+        z_to_idx = self._z_to_idx
 
         # Validate all z values upfront
         for z in atomic_numbers:
@@ -254,13 +264,13 @@ class MACEMLXCalculator(Calculator):
         # Positions always float32 for accurate force gradients via autograd.
         # Other float inputs match the model's compute dtype.
         positions_mx = mx.array(atoms.get_positions().astype(np.float32))
-        node_attrs_mx = mx.array(node_attrs_np).astype(self._compute_dtype)
+        node_attrs_mx = mx.array(node_attrs_np, dtype=self._compute_dtype)
         edge_index_mx = mx.array(edge_index_np)
-        shifts_mx = mx.array(shifts_np).astype(self._compute_dtype)
+        shifts_mx = mx.array(shifts_np, dtype=self._compute_dtype)
 
         cell_np = np.array(atoms.get_cell(), dtype=np.float32)
         has_cell = atoms.cell.rank > 0
-        cell_mx = mx.array(cell_np).astype(self._compute_dtype) if has_cell else None
+        cell_mx = mx.array(cell_np, dtype=self._compute_dtype) if has_cell else None
 
         if self._cached_batch_mx is None or self._cached_batch_mx.shape[0] != num_atoms:
             self._cached_batch_mx = mx.zeros(num_atoms, dtype=mx.int32)
@@ -317,13 +327,9 @@ class MACEMLXCalculator(Calculator):
         """Compute energy (scalar), forces (num_atoms, 3), and node_energy via value_and_grad."""
         compute_dtype = self._compute_dtype
 
-        # Stop gradient on non-position inputs to reduce autograd graph cost
-        node_attrs = mx.stop_gradient(node_attrs)
-        edge_index = mx.stop_gradient(edge_index)
-        shifts = mx.stop_gradient(shifts)
-        if cell is not None:
-            cell = mx.stop_gradient(cell)
-        batch = mx.stop_gradient(batch)
+        node_attrs, edge_index, shifts, cell, batch = self._stop_grad_inputs(
+            node_attrs, edge_index, shifts, cell, batch
+        )
 
         # Mutable container to capture node_energy from the forward pass
         captured = {}
@@ -375,13 +381,9 @@ class MACEMLXCalculator(Calculator):
         model = self.model
         compute_dtype = self._compute_dtype
 
-        # Stop gradient on non-position inputs to reduce autograd graph cost
-        node_attrs = mx.stop_gradient(node_attrs)
-        edge_index = mx.stop_gradient(edge_index)
-        shifts = mx.stop_gradient(shifts)
-        if cell is not None:
-            cell = mx.stop_gradient(cell)
-        batch = mx.stop_gradient(batch)
+        node_attrs, edge_index, shifts, cell, batch = self._stop_grad_inputs(
+            node_attrs, edge_index, shifts, cell, batch
+        )
 
         # Mutable container to capture node_energy from the forward pass
         captured = {}

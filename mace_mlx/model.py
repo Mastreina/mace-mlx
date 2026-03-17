@@ -72,8 +72,6 @@ class MACE(nn.Module):
         super().__init__()
         self.r_max = r_max
 
-        # Float16 mixed precision: accumulate energy in float32 for stability
-        self._accumulate_float32 = True
         self.max_ell = max_ell
         self.num_interactions = num_interactions
 
@@ -426,13 +424,10 @@ class MACE(nn.Module):
             node_es = self._readout_select_head(raw)
             node_energies_list.append(node_es)
 
-        # 8. Accumulate energies
-        if self._accumulate_float32:
-            node_energy = mx.stack(
-                [e.astype(mx.float32) for e in node_energies_list], axis=0
-            ).sum(axis=0)
-        else:
-            node_energy = mx.stack(node_energies_list, axis=0).sum(axis=0)
+        # 8. Accumulate energies (float32 upcast for numerical stability)
+        node_energy = mx.stack(
+            [e.astype(mx.float32) for e in node_energies_list], axis=0
+        ).sum(axis=0)
 
         energy = scatter_sum(
             node_energy[:, None], batch, num_graphs
@@ -508,12 +503,9 @@ class MACE(nn.Module):
             node_energies_list.append(node_es)
 
         # Accumulate energies (float32 upcast for numerical stability)
-        if self._accumulate_float32:
-            node_energy = mx.stack(
-                [e.astype(mx.float32) for e in node_energies_list], axis=0
-            ).sum(axis=0)
-        else:
-            node_energy = mx.stack(node_energies_list, axis=0).sum(axis=0)
+        node_energy = mx.stack(
+            [e.astype(mx.float32) for e in node_energies_list], axis=0
+        ).sum(axis=0)
 
         energy = scatter_sum(
             node_energy[:, None], batch, num_graphs
@@ -575,12 +567,9 @@ class MACE(nn.Module):
             node_energies_list.append(node_es)
 
         # Accumulate energies (float32 upcast for numerical stability)
-        if self._accumulate_float32:
-            node_energy = mx.stack(
-                [e.astype(mx.float32) for e in node_energies_list], axis=0
-            ).sum(axis=0)
-        else:
-            node_energy = mx.stack(node_energies_list, axis=0).sum(axis=0)
+        node_energy = mx.stack(
+            [e.astype(mx.float32) for e in node_energies_list], axis=0
+        ).sum(axis=0)
 
         energy = scatter_sum(
             node_energy[:, None], batch, num_graphs
@@ -682,22 +671,15 @@ class ScaleShiftMACE(MACE):
             node_es = self._readout_select_head(raw)
             node_es_list.append(node_es)
 
-        # Scale-shift on interaction energies
-        if self._accumulate_float32:
-            node_inter_es = mx.stack(
-                [e.astype(mx.float32) for e in node_es_list], axis=0
-            ).sum(axis=0)
-        else:
-            node_inter_es = mx.stack(node_es_list, axis=0).sum(axis=0)
+        # Scale-shift on interaction energies (float32 upcast for numerical stability)
+        node_inter_es = mx.stack(
+            [e.astype(mx.float32) for e in node_es_list], axis=0
+        ).sum(axis=0)
         node_inter_es = self.scale_val * node_inter_es + self.shift_val
 
         # Total node energy = e0 + scaled interaction
-        if self._accumulate_float32:
-            node_energy = node_e0.astype(mx.float32) + node_inter_es
-            e0 = scatter_sum(node_e0.astype(mx.float32)[:, None], batch, num_graphs).squeeze(-1)
-        else:
-            node_energy = node_e0 + node_inter_es
-            e0 = scatter_sum(node_e0[:, None], batch, num_graphs).squeeze(-1)
+        node_energy = node_e0.astype(mx.float32) + node_inter_es
+        e0 = scatter_sum(node_e0.astype(mx.float32)[:, None], batch, num_graphs).squeeze(-1)
 
         # Per-graph energies
         inter_e = scatter_sum(

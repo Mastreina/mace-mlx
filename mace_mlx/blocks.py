@@ -202,7 +202,7 @@ class RealAgnosticInteractionBlock(nn.Module):
 
         # 3-4. Message computation + aggregation
         if self._use_fused_kernel:
-            # Fused Metal kernel: gather + multiply + scatter in one pass
+            # Fused gather-TP-scatter (pure MLX, autograd-compatible)
             message = gather_tp_scatter(
                 node_feats_up, tp_weights, edge_attrs[:, 0],
                 sender, receiver, num_nodes,
@@ -329,7 +329,7 @@ class RealAgnosticResidualInteractionBlock(nn.Module):
 
         # 3-4. Message computation + aggregation
         if self._use_fused_kernel:
-            # Fused Metal kernel: gather + multiply + scatter in one pass
+            # Fused gather-TP-scatter (pure MLX, autograd-compatible)
             message = gather_tp_scatter(
                 node_feats_up, tp_weights, edge_attrs[:, 0],
                 sender, receiver, num_nodes,
