@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mace-mlx"
-version = "0.1.0"
+version = "0.2.0"
 description = "GPU-accelerated MACE interatomic potential inference on Apple Silicon via MLX"
 readme = "README.md"
 license = "MIT"
