@@ -7,6 +7,7 @@ on macOS, using MLX for GPU-accelerated inference on Apple Silicon.
 from __future__ import annotations
 
 import tempfile
+import warnings
 from pathlib import Path
 
 import mlx.core as mx
@@ -38,6 +39,9 @@ def _build_neighbor_list(
     if _USE_MATSCIPY and atoms.cell.rank == 3:
         return _matscipy_nl("ijS", atoms, r_max)
     return _ase_nl("ijS", atoms.pbc, atoms.cell, atoms.positions, r_max)
+
+
+_DEVICE_MAP = {"cuda": "gpu", "mps": "gpu", "gpu": "gpu", "cpu": "cpu", "": "gpu"}
 
 
 class MACEMLXCalculator(Calculator):
@@ -72,10 +76,18 @@ class MACEMLXCalculator(Calculator):
         skin: float = 0.5,
         **kwargs,
     ):
-        super().__init__(**kwargs)
-
+        # Accept mace-torch model_paths parameter
+        if model_path is None:
+            model_path = kwargs.pop("model_paths", None)
+            if isinstance(model_path, (list, tuple)):
+                model_path = model_path[0]
         if model_path is None:
             model_path = "small"
+
+        # Map mace-torch device names to MLX equivalents
+        device = _DEVICE_MAP.get(device, device)
+
+        super().__init__(**kwargs)
 
         model_dir = self._resolve_model(model_path)
         self.model = load_model(model_dir, dtype=default_dtype)
@@ -457,6 +469,7 @@ class MACEMLXCalculator(Calculator):
 
 def mace_mp(model: str = "small", device: str = "gpu",
             default_dtype: str = "float32", head: str | None = None,
+            dispersion: bool = False, return_raw_model: bool = False,
             **kwargs) -> MACEMLXCalculator:
     """Load a MACE-MP foundation model.
 
@@ -467,11 +480,23 @@ def mace_mp(model: str = "small", device: str = "gpu",
         device: "gpu" (default, Apple Silicon) or "cpu".
         default_dtype: "float32" (default) or "float16".
         head: Head name for multi-head models (e.g., "matpes_r2scan").
+        dispersion: Ignored (D3 dispersion not supported in MLX).
+        return_raw_model: Not supported; raises NotImplementedError.
         **kwargs: Passed to MACEMLXCalculator.
 
     Returns:
         MACEMLXCalculator with the requested MACE-MP model loaded.
     """
+    if return_raw_model:
+        raise NotImplementedError("return_raw_model is not supported in MACE-MLX")
+    if dispersion:
+        warnings.warn(
+            "MACE-MLX does not support D3 dispersion corrections. "
+            "Ignoring dispersion=True."
+        )
+    # Pop mace-torch dispersion kwargs silently
+    for key in ("damping", "dispersion_xc", "dispersion_cutoff"):
+        kwargs.pop(key, None)
     return MACEMLXCalculator(model_path=model, device=device,
                               default_dtype=default_dtype, head=head, **kwargs)
 
@@ -493,3 +518,23 @@ def mace_off(model: str = "small", device: str = "gpu",
     """
     return MACEMLXCalculator(model_path=f"off-{model}", device=device,
                               default_dtype=default_dtype, **kwargs)
+
+
+def mace_anicc(**kwargs) -> MACEMLXCalculator:
+    """MACE-ANI is not yet supported in MACE-MLX."""
+    raise NotImplementedError(
+        "mace_anicc is not yet supported in MACE-MLX. "
+        "Use mace-torch for ANI models."
+    )
+
+
+def mace_omol(**kwargs) -> MACEMLXCalculator:
+    """MACE-OMOL is not yet supported in MACE-MLX."""
+    raise NotImplementedError(
+        "mace_omol is not yet supported in MACE-MLX. "
+        "Use mace-torch for OMOL models."
+    )
+
+
+# Drop-in compatibility alias
+MACECalculator = MACEMLXCalculator
