@@ -146,5 +146,9 @@
   `docs/prototypes/profile_after.json`（当前 v0.3.0 基线，**以此为起点**）。
 - 当前整步水平（v0.3.0，M4 Pro）：medium/Si1000 e2e ≈ 503 ms（其中 prod
   仍占前向约 1/3）、small/Si1000 ≈ 165 ms（prod 占 ~63%，本任务的最大
-  受益者）、medium/Si2000 峰值内存 ~38 GB（本任务的内存目标：降到
-  15 GB 以下）。
+  受益者）、medium/Si2000 峰值内存 ~38 GB。
+- 端到端内存的正确预期（2026-07-04 修正）：峰值是 max-concurrent 而非
+  求和——SC 的 WU 消掉后，峰值大概率被第二层 interaction 的逐边中间
+  张量接管，Si2000 落点估计 20-25 GB。端到端验收为「SC 不再是峰值
+  来源 + Si2000 峰值显著下降」，不以 15 GB 为硬线；SC 块级 ≥3× 的
+  验收（§1）不变。
