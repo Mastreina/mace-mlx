@@ -175,5 +175,36 @@
    "df_rms": 5.194049519747968e-06,
    "f_rms": 0.41465621350947
   }
+ },
+ "version_speed_md_ms_per_step": {
+  "note": "MD-loop timing (VelocityVerlet, warmup 5 + 40 steps), medium-mpa-0 fp32; peak memory MB in parens",
+  "mgo100_1000atoms": {
+   "v0.3.0": [
+    990.5,
+    31521
+   ],
+   "v0.4.0": [
+    818.5,
+    23303
+   ],
+   "v0.5.0": [
+    238.0,
+    9129
+   ]
+  },
+  "cu111_big_2560atoms": {
+   "v0.3.0": [
+    5051.9,
+    53614
+   ],
+   "v0.4.0": [
+    1759.0,
+    42993
+   ],
+   "v0.5.0": [
+    481.7,
+    13462
+   ]
+  }
  }
 }
