@@ -1,0 +1,62 @@
+{
+ "small/Si216/dense": {
+  "e2e_ms": 35.60962504707277,
+  "peak_mem_mb": 2164.01212,
+  "natoms": 216
+ },
+ "small/Si216/sparse": {
+  "e2e_ms": 24.853583541698754,
+  "peak_mem_mb": 1583.60892,
+  "natoms": 216
+ },
+ "small/Si1000/dense": {
+  "e2e_ms": 166.80822893977165,
+  "peak_mem_mb": 6750.081012,
+  "natoms": 1000
+ },
+ "small/Si1000/sparse": {
+  "e2e_ms": 115.27037498308346,
+  "peak_mem_mb": 2893.680624,
+  "natoms": 1000
+ },
+ "medium-mpa-0/Si216/dense": {
+  "e2e_ms": 106.316874967888,
+  "peak_mem_mb": 4511.523072,
+  "natoms": 216
+ },
+ "medium-mpa-0/Si216/sparse": {
+  "e2e_ms": 80.76343749416992,
+  "peak_mem_mb": 2693.704448,
+  "natoms": 216
+ },
+ "medium-mpa-0/Si1000/dense": {
+  "e2e_ms": 504.3404789757915,
+  "peak_mem_mb": 18877.687548,
+  "natoms": 1000
+ },
+ "medium-mpa-0/Si1000/sparse": {
+  "e2e_ms": 378.99012496927753,
+  "peak_mem_mb": 10659.079932,
+  "natoms": 1000
+ },
+ "medium-mpa-0/Si2000/dense": {
+  "e2e_ms": 1300.8175209979527,
+  "peak_mem_mb": 37685.977436,
+  "natoms": 2000
+ },
+ "medium-mpa-0/Si2000/sparse": {
+  "e2e_ms": 763.1300624925643,
+  "peak_mem_mb": 21248.74582,
+  "natoms": 2000
+ },
+ "large/Si512/dense": {
+  "e2e_ms": 391.4238750003278,
+  "peak_mem_mb": 16220.02372,
+  "natoms": 512
+ },
+ "large/Si512/sparse": {
+  "e2e_ms": 260.27116598561406,
+  "peak_mem_mb": 6856.616872,
+  "natoms": 512
+ }
+}

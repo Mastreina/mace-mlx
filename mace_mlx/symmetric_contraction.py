@@ -4,12 +4,20 @@ MLX implementation matching MACE's SymmetricContraction module.
 Uses precomputed U matrices (from CG coefficients) to contract
 node features into body-order invariants/equivariants.
 
-Performance: The forward pass uses a "weights-first" matmul decomposition
-that contracts the parameter dimension (k) with element-selected weights
-before contracting the coupling dimension (i) with features. This reduces
-intermediate tensor size from O(batch * features * prefix * k) to
-O(batch * features * prefix * i), yielding ~3x speedup for L>0 outputs
-on Apple Silicon by reducing memory bandwidth pressure.
+Performance: The main (nu=correlation) contraction exploits the ~99.5%
+sparsity of the U tensor via an (i,k)-row-compressed bilinear form: U has
+only a few hundred nonzero (i, k) index pairs, so
+
+    out[b,c,p] = sum_r U_rows[r,p] * f[b,c,i_r] * W[b,c,k_r]
+
+is evaluated as two thin selector GEMMs (constant 0/1 matrices), one
+aligned elementwise multiply, and one dense GEMM over the compressed row
+dimension. Everything is GEMM + elementwise, so autograd's VJPs are
+transposed GEMMs (no gather/scatter), and the huge dense
+O(batch * features * prefix * i) intermediate is never materialized:
+~2.7x faster fwd+bwd and ~4x lower peak memory per contraction on Apple
+Silicon versus the dense weights-first decomposition, which is kept as
+the fallback (and for the lower-order steps, where it is already cheap).
 
 Reference: Batatia et al., MACE: Higher Order Equivariant Message Passing
 Neural Networks for Fast and Accurate Force Fields, Eq. 10 and 11.
@@ -64,7 +72,20 @@ class Contraction(nn.Module):
     Implements the recursive contraction using precomputed U matrices
     and learnable element-dependent weights.
 
-    The forward pass uses a "weights-first" matmul decomposition:
+    The main (nu=correlation) step exploits U's sparsity: U has only nrow
+    nonzero (i, k) index pairs (~30% of i*k for real MACE models, with
+    ~99.5% of U's entries zero overall), so
+
+        out[b,c,p] = sum_r U_rows[r,p] * f[b,c,i_r] * W_sel[b,c,k_r]
+
+    is computed as X = (f @ SelI) * (W_sel @ SelK) followed by X @ U_rows,
+    where SelI/SelK are constant 0/1 selector matrices. Using selector
+    GEMMs instead of mx.take keeps autograd's VJPs as transposed GEMMs
+    (mx.take's VJP is a slow scatter-add), and the dense
+    (b, c, prefix, i) intermediate WU is never materialized.
+
+    When the sparse path does not apply (all-zero U or insufficient
+    sparsity), the dense "weights-first" matmul decomposition is used:
 
     Original main einsum: "...ik,ekc,bci,be->bc..."
     Weights-first decomposition:
@@ -72,8 +93,8 @@ class Contraction(nn.Module):
       2. WU = W_sel @ U_wf                    -- contract k: (b,c,k) @ (k,prefix*i)
       3. result = WU_reshaped @ feat_col      -- contract i: (b,c,prefix,i) @ (b,c,i,1)
 
-    This contracts k (parameter dim, typically 23-51) before i (coupling dim,
-    typically 16), producing smaller intermediates than the i-first approach.
+    The lower-order (nu < correlation) steps always use the dense form:
+    their U matrices are small and the dense matmuls are already cheap.
 
     For correlation <= 4 (the common MACE configurations), an unrolled fast
     path eliminates the Python loop and per-iteration method call overhead.
@@ -208,6 +229,45 @@ class Contraction(nn.Module):
             self._cached_wmax_id = None
             self._cached_wlower_ids = None
 
+        # --- Sparse main contraction setup ---
+        self._use_sparse_main = False
+        if self._use_unrolled:
+            self._setup_sparse_main()
+
+    def _setup_sparse_main(self) -> None:
+        """Precompute the (i,k)-row-compressed form of the main U tensor.
+
+        Extracts the nonzero (i, k) index pairs of U (viewed as
+        (prefix, i, k)) and builds three constants:
+          SelI (i_dim, nrow), SelK (k_dim, nrow) -- 0/1 selector matrices
+          U_rows (nrow, prefix)                  -- U values at those pairs
+        Enables the sparse path only when U is sparse enough for the
+        bilinear form to win over the dense GEMM.
+        """
+        U2 = np.array(self._u_matrices[self.correlation]).reshape(
+            self._u_main_prefix_size, self._u_main_i_dim, self._u_main_k_dim
+        )
+        i_r, k_r = np.nonzero(np.abs(U2).max(axis=0) > 1e-12)
+        nrow = len(i_r)
+        # Fall back to the dense path when U is all zero (nrow == 0) or when
+        # the expand GEMMs + multiply would not pay for themselves (real
+        # MACE U tensors sit at ~30% nonzero rows).
+        if nrow == 0 or nrow > 0.5 * self._u_main_i_dim * self._u_main_k_dim:
+            return
+        sel_i = np.zeros((self._u_main_i_dim, nrow), dtype=np.float32)
+        sel_i[i_r, np.arange(nrow)] = 1.0
+        sel_k = np.zeros((self._u_main_k_dim, nrow), dtype=np.float32)
+        sel_k[k_r, np.arange(nrow)] = 1.0
+        u_rows = U2[:, i_r, k_r].T.astype(np.float32)  # (nrow, prefix)
+        self._sp_sel_i = mx.stop_gradient(mx.array(sel_i))
+        self._sp_sel_k = mx.stop_gradient(mx.array(sel_k))
+        self._sp_u_rows = mx.stop_gradient(mx.array(u_rows))
+        # Materialize now: mx.compile can read garbage from lazy arrays
+        # captured by closure when the trace happens before their first
+        # eval (MLX 0.31.2, see docs/prototypes/sparse_sc_results.md).
+        mx.eval(self._sp_sel_i, self._sp_sel_k, self._sp_u_rows)
+        self._use_sparse_main = True
+
     def _ensure_weight_caches(self):
         """Lazily recompute pre-transposed+reshaped weight caches when weights change."""
         wmax_id = id(self.weights_max)
@@ -241,6 +301,10 @@ class Contraction(nn.Module):
             self._u_lower_2d_t = [u.astype(dtype) for u in self._u_lower_2d_t]
             # Invalidate weight caches so they are recomputed on next call
             self._cached_wmax_id = None
+        if self._use_sparse_main:
+            self._sp_sel_i = self._sp_sel_i.astype(dtype)
+            self._sp_sel_k = self._sp_sel_k.astype(dtype)
+            self._sp_u_rows = self._sp_u_rows.astype(dtype)
 
     def __call__(self, features: mx.array, element_onehot: mx.array) -> mx.array:
         """Forward pass: recursive contraction using matmul decomposition.
@@ -292,14 +356,21 @@ class Contraction(nn.Module):
         k_m = self.weights_max.shape[1]
         W_sel_ck = (element_onehot @ self._W_max_ck).reshape(b, num_c, k_m)
 
-        # Contract k with U: (b,c,k) @ (k, prefix*i) -> (b,c,prefix,i)
-        prefix_size = self._u_main_prefix_size
-        i_dim = self._u_main_i_dim
-        WU = (W_sel_ck @ self._u_main_wf).reshape(b, num_c, prefix_size, i_dim)
-
-        # Contract i with features: (b,c,prefix,i) @ (b,c,i,1) -> (b,c,prefix)
         feat_col = features[:, :, :, None]  # computed once, reused below
-        out = (WU @ feat_col).reshape(b, num_c, prefix_size)
+
+        if self._use_sparse_main:
+            # Row-compressed bilinear form over U's nonzero (i,k) pairs:
+            # X[b,c,r] = f[b,c,i_r] * W[b,c,k_r], out = X @ U_rows.
+            X = (features @ self._sp_sel_i) * (W_sel_ck @ self._sp_sel_k)
+            out = X @ self._sp_u_rows  # (b,c,prefix)
+        else:
+            # Dense fallback: contract k with U, then i with features.
+            prefix_size = self._u_main_prefix_size
+            i_dim = self._u_main_i_dim
+            WU = (W_sel_ck @ self._u_main_wf).reshape(
+                b, num_c, prefix_size, i_dim
+            )
+            out = (WU @ feat_col).reshape(b, num_c, prefix_size)
 
         # --- Lower-order iterations (unrolled) ---
         u_lower_t = self._u_lower_2d_t
