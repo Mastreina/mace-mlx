@@ -77,21 +77,24 @@ short-range/high-pressure configurations match mace-torch.
 
 ## Performance
 
-MACE-MP-0 Small on Apple Silicon (energy + forces, v0.2.0 measurements):
+Energy + forces per step on Apple M4 Pro (48 GB), rattled bulk Si,
+`medium-mpa-0` (the default model), fp32:
 
-| System | Atoms | MLX (ms) | CPU (ms) | MPS (ms) |
-|--------|-------|----------|----------|----------|
-| Water | 3 | 3.5 | 8.0 | 16.7 |
-| Si 2x2x2 | 16 | 4.1 | 16.3 | 17.5 |
-| Cu 3x3x3 | 27 | 7.6 | 25.7 | 21.3 |
-| Si 3x3x3 | 54 | 10.9 | 31.7 | 25.5 |
-| Al 3x3x3 | 27 | 6.0 | 21.5 | 19.8 |
+| Configuration | Si 1000 atoms | Si 2000 atoms |
+|---|---:|---:|
+| mace-torch cpu, float64 (its default) | 2101 ms | 4293 ms |
+| mace-torch cpu, float32 | 1181 ms | 2355 ms |
+| mace-mlx 0.3.0 | 535 ms | 1543 ms |
+| mace-mlx 0.4.0 (sparse symmetric contraction) | 379 ms | 763 ms |
+| **mace-mlx 0.5.0 (fused Metal kernels)** | **137 ms** | **275 ms** |
 
-Since v0.2.0, per-step time improved further on top of the numbers above
-(measured on M4 Pro, same systems/models): medium models (`medium-mpa-0`
-default) run **1.3-1.5x faster** (e.g. Si 1000 atoms: 678 -> 503 ms), large
-1.2-1.3x, small 1.04-1.07x, via a batched second-layer tensor product,
-`mx.compile`, and per-step caching. See `docs/OPTIMIZATION_REVIEW.md`.
+That is ~15x over mace-torch's official default and ~9x at equal (fp32)
+precision, with peak memory 5.3 GB (Si1000) / 8.3 GB (Si2000). mace-torch's
+own MPS backend does not run out of the box (float64 checkpoints and a
+hardcoded `.double()` in forward). `default_dtype="float16"` gives a
+further ~1.45x where its accuracy fits (see below). Smaller L=0 models
+(`small`) gain less from the fused kernels (~110 ms / Si1000). Benchmarks
+and raw data: `docs/prototypes/`.
 
 ## API
 
@@ -113,8 +116,14 @@ ASE Calculator class. Accepts the same parameters plus `model_path`, `skin`
   `"float64"` warns and falls back to float32). Expect float32-level
   agreement (~1e-5 eV/A in forces) against torch's float64 results.
 - `float16` runs the feature path in half precision while keeping geometry,
-  radial basis, E0, and energy accumulation in float32 (~0.6-1.2 meV/atom
-  vs float32; no speed advantage on M-series, treat as experimental).
+  radial basis, E0, and energy accumulation in float32. It is ~1.45x faster
+  and validated per use case (details in
+  `docs/prototypes/team_fp16_report.md`): fine for NVT/NPT MD and
+  relaxations down to fmax≈0.01 eV/A (force error <=1% rel-RMS,
+  ~1 meV/atom near equilibrium); avoid for phonons/Hessians (finite-
+  difference force constants), tight relaxations (fmax<0.005), and
+  absolute-energy comparisons of highly strained structures (systematic
+  shifts up to ~10 meV/atom observed).
 - Committee models (a list in `model_paths`) are not supported and raise.
 - `dispersion=True` is ignored — combine with a CPU D3 calculator via
   ASE's `SumCalculator` if needed.
