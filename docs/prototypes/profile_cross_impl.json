@@ -1,0 +1,218 @@
+{
+ "mlx-sparse/medium-mpa-0/Si216": {
+  "e2e_ms": 86.32095850771293,
+  "energy_ev": -1160.034423828125,
+  "fmax": 2.8900935649871826,
+  "natoms": 216,
+  "version": "mace-mlx 0.3.0 @ /Users/mastreina/Desktop/mace-mlx",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "mlx-v030/medium-mpa-0/Si216": {
+  "e2e_ms": 114.24429150065407,
+  "energy_ev": -1160.034423828125,
+  "fmax": 2.890094757080078,
+  "natoms": 216,
+  "version": "mace-mlx 0.3.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v030",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "torch-cpu64/medium-mpa-0/Si216": {
+  "e2e_ms": 457.9500625259243,
+  "energy_ev": -1160.0340947029235,
+  "fmax": 2.8901078456485965,
+  "natoms": 216,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float64"
+ },
+ "torch-mps32/medium-mpa-0/Si216": {
+  "e2e_ms": 244.5224789553322,
+  "energy_ev": -1160.03369140625,
+  "fmax": 2.890085220336914,
+  "natoms": 216,
+  "version": "mace-torch 0.3.16 (MPS workaround)",
+  "device": "mps",
+  "dtype": "float32"
+ },
+ "torch-cpu32/medium-mpa-0/Si216": {
+  "e2e_ms": 281.02508350275457,
+  "energy_ev": -1160.0340576171875,
+  "fmax": 2.8900866508483887,
+  "natoms": 216,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float32"
+ },
+ "mlx-v020/medium-mpa-0/Si216": {
+  "e2e_ms": 150.08214605040848,
+  "energy_ev": -1160.0341796875,
+  "fmax": 2.8899905681610107,
+  "natoms": 216,
+  "version": "mace-mlx 0.2.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v020",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "torch-cpu64/small/Si1000": {
+  "e2e_ms": 568.2367914705537,
+  "energy_ev": -5333.902540396535,
+  "fmax": 2.567944124077201,
+  "natoms": 1000,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float64"
+ },
+ "torch-cpu32/small/Si1000": {
+  "e2e_ms": 321.9813545001671,
+  "energy_ev": -5333.9267578125,
+  "fmax": 2.567937135696411,
+  "natoms": 1000,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float32"
+ },
+ "torch-mps32/small/Si1000": {
+  "e2e_ms": 361.78914550691843,
+  "energy_ev": -5333.92822265625,
+  "fmax": 2.5679402351379395,
+  "natoms": 1000,
+  "version": "mace-torch 0.3.16 (MPS workaround)",
+  "device": "mps",
+  "dtype": "float32"
+ },
+ "mlx-v020/small/Si1000": {
+  "e2e_ms": 185.2852915180847,
+  "energy_ev": -5333.9287109375,
+  "fmax": 2.5679378509521484,
+  "natoms": 1000,
+  "version": "mace-mlx 0.2.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v020",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "mlx-v030/small/Si1000": {
+  "e2e_ms": 178.99383348412812,
+  "energy_ev": -5333.9013671875,
+  "fmax": 2.5679378509521484,
+  "natoms": 1000,
+  "version": "mace-mlx 0.3.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v030",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "mlx-sparse/small/Si1000": {
+  "e2e_ms": 123.26912448043004,
+  "energy_ev": -5333.9013671875,
+  "fmax": 2.5679373741149902,
+  "natoms": 1000,
+  "version": "mace-mlx 0.3.0 @ /Users/mastreina/Desktop/mace-mlx",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "torch-cpu64/medium-mpa-0/Si1000": {
+  "e2e_ms": 2101.0501664713956,
+  "energy_ev": -5368.418992171456,
+  "fmax": 3.1093913462097857,
+  "natoms": 1000,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float64"
+ },
+ "torch-cpu32/medium-mpa-0/Si1000": {
+  "e2e_ms": 1180.9673130046576,
+  "energy_ev": -5368.42578125,
+  "fmax": 3.1093740463256836,
+  "natoms": 1000,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float32"
+ },
+ "torch-mps32/medium-mpa-0/Si1000": {
+  "e2e_ms": 1267.5898750312626,
+  "energy_ev": -5368.42578125,
+  "fmax": 3.109384059906006,
+  "natoms": 1000,
+  "version": "mace-torch 0.3.16 (MPS workaround)",
+  "device": "mps",
+  "dtype": "float32"
+ },
+ "mlx-v020/medium-mpa-0/Si1000": {
+  "e2e_ms": 701.8723959918134,
+  "energy_ev": -5368.42626953125,
+  "fmax": 3.1078362464904785,
+  "natoms": 1000,
+  "version": "mace-mlx 0.2.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v020",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "mlx-v030/medium-mpa-0/Si1000": {
+  "e2e_ms": 534.8383959499188,
+  "energy_ev": -5368.419921875,
+  "fmax": 3.109377384185791,
+  "natoms": 1000,
+  "version": "mace-mlx 0.3.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v030",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "mlx-sparse/medium-mpa-0/Si1000": {
+  "e2e_ms": 402.02981198672205,
+  "energy_ev": -5368.419921875,
+  "fmax": 3.109377384185791,
+  "natoms": 1000,
+  "version": "mace-mlx 0.3.0 @ /Users/mastreina/Desktop/mace-mlx",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "torch-cpu64/medium-mpa-0/Si2000": {
+  "e2e_ms": 4293.1718960171565,
+  "energy_ev": -10739.385787478785,
+  "fmax": 2.6914477245260704,
+  "natoms": 2000,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float64"
+ },
+ "torch-cpu32/medium-mpa-0/Si2000": {
+  "e2e_ms": 2354.8569165868685,
+  "energy_ev": -10739.412109375,
+  "fmax": 2.6914539337158203,
+  "natoms": 2000,
+  "version": "mace-torch 0.3.16",
+  "device": "cpu",
+  "dtype": "float32"
+ },
+ "torch-mps32/medium-mpa-0/Si2000": {
+  "e2e_ms": 2913.9732504845597,
+  "energy_ev": -10739.404296875,
+  "fmax": 2.6914546489715576,
+  "natoms": 2000,
+  "version": "mace-torch 0.3.16 (MPS workaround)",
+  "device": "mps",
+  "dtype": "float32"
+ },
+ "mlx-v020/medium-mpa-0/Si2000": {
+  "e2e_ms": 2489.6332914941013,
+  "energy_ev": -10739.4169921875,
+  "fmax": 2.6908860206604004,
+  "natoms": 2000,
+  "version": "mace-mlx 0.2.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v020",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "mlx-v030/medium-mpa-0/Si2000": {
+  "e2e_ms": 1543.3070004801266,
+  "energy_ev": -10739.388671875,
+  "fmax": 2.691458225250244,
+  "natoms": 2000,
+  "version": "mace-mlx 0.3.0 @ /private/tmp/claude-501/-Users-mastreina-Desktop-mace-mlx/25918f5b-8f0e-48d3-a2d3-5900e397f165/scratchpad/wt-v030",
+  "device": "gpu",
+  "dtype": "float32"
+ },
+ "mlx-sparse/medium-mpa-0/Si2000": {
+  "e2e_ms": 799.921291472856,
+  "energy_ev": -10739.388671875,
+  "fmax": 2.691455841064453,
+  "natoms": 2000,
+  "version": "mace-mlx 0.3.0 @ /Users/mastreina/Desktop/mace-mlx",
+  "device": "gpu",
+  "dtype": "float32"
+ }
+}

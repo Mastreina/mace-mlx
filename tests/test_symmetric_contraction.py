@@ -513,3 +513,140 @@ class TestProperties:
             assert "_u_matrices" not in key, (
                 f"U matrix found in trainable params: {key}"
             )
+
+
+# ---------------------------------------------------------------------------
+# 6. Sparse main contraction vs dense fallback
+# ---------------------------------------------------------------------------
+
+
+class TestSparseMainPath:
+    """The sparse (row-compressed) main step must match the dense fallback.
+
+    The sparse path is the production path; the dense weights-first
+    decomposition remains as fallback. Forcing the flag off on the same
+    module compares both on identical weights.
+    """
+
+    CONFIGS = [
+        # (irreps_in, irreps_out, correlation) -- covers lout 0/1/2, corr 2/3/4
+        ("2x0e + 2x1o", "2x0e", 2),
+        ("2x0e + 2x1o", "2x0e", 3),
+        ("2x0e + 2x1o", "2x1o", 3),
+        ("4x0e + 4x1o + 4x2e + 4x3o", "4x0e", 3),
+        ("4x0e + 4x1o + 4x2e + 4x3o", "4x1o", 3),
+        ("2x0e + 2x1o + 2x2e", "2x2e", 3),
+        ("2x0e + 2x1o", "2x0e", 4),
+    ]
+
+    def _make(self, irreps_in, irreps_out, correlation):
+        mx.random.seed(7)
+        sc = SymmetricContraction(
+            irreps_in=irreps_in,
+            irreps_out=irreps_out,
+            correlation=correlation,
+            num_elements=3,
+        )
+        dim = Irreps(irreps_in).dim
+        x = mx.random.normal(shape=(5, dim))
+        y = mx.softmax(mx.random.normal(shape=(5, 3)), axis=-1)
+        return sc, x, y
+
+    @pytest.mark.parametrize(
+        "irreps_in,irreps_out,correlation",
+        [
+            # Real-model-sized coupling (16-dim): ~30% nonzero rows
+            ("4x0e + 4x1o + 4x2e + 4x3o", "4x0e", 3),
+            ("4x0e + 4x1o + 4x2e + 4x3o", "4x1o", 3),
+        ],
+    )
+    def test_sparse_path_active(self, irreps_in, irreps_out, correlation):
+        """Real-model-sized contractions should take the sparse path."""
+        sc, _, _ = self._make(irreps_in, irreps_out, correlation)
+        for contr in sc.contractions:
+            if contr._path_weights[correlation - 1]:
+                assert contr._use_sparse_main
+
+    def test_dense_fallback_when_not_sparse(self):
+        """Tiny coupling spaces exceed the sparsity guard and fall back."""
+        sc, x, y = self._make("2x0e + 2x1o", "2x1o", 3)  # 58% nonzero rows
+        assert not any(c._use_sparse_main for c in sc.contractions)
+        out = sc(x, y)  # dense fallback must still work
+        assert bool(mx.all(mx.isfinite(out)))
+
+    @pytest.mark.parametrize("irreps_in,irreps_out,correlation", CONFIGS)
+    def test_forward_matches_dense(self, irreps_in, irreps_out, correlation):
+        sc, x, y = self._make(irreps_in, irreps_out, correlation)
+        out_sparse = np.array(sc(x, y))
+        for contr in sc.contractions:
+            contr._use_sparse_main = False
+        out_dense = np.array(sc(x, y))
+        np.testing.assert_allclose(out_sparse, out_dense, atol=1e-5)
+
+    @pytest.mark.parametrize("irreps_in,irreps_out,correlation", CONFIGS)
+    def test_grad_matches_dense(self, irreps_in, irreps_out, correlation):
+        """d(output)/d(features) must match between sparse and dense paths."""
+        sc, x, y = self._make(irreps_in, irreps_out, correlation)
+
+        def loss(x_):
+            return mx.sum(sc(x_, y) ** 2)
+
+        g_sparse = np.array(mx.grad(loss)(x))
+        for contr in sc.contractions:
+            contr._use_sparse_main = False
+        g_dense = np.array(mx.grad(loss)(x))
+        scale = max(1.0, np.abs(g_dense).max())
+        np.testing.assert_allclose(g_sparse / scale, g_dense / scale, atol=1e-5)
+
+    @pytest.mark.parametrize("irreps_in,irreps_out,correlation", CONFIGS)
+    def test_weight_grad_matches_dense(self, irreps_in, irreps_out, correlation):
+        """d(output)/d(weights_max) must match between sparse and dense paths."""
+        sc, x, y = self._make(irreps_in, irreps_out, correlation)
+
+        def loss(params):
+            sc.update(params)
+            return mx.sum(sc(x, y) ** 2)
+
+        import mlx.nn as nn
+
+        g_sparse = nn.utils.tree_flatten(mx.grad(loss)(sc.parameters()))
+        for contr in sc.contractions:
+            contr._use_sparse_main = False
+        g_dense = nn.utils.tree_flatten(mx.grad(loss)(sc.parameters()))
+        assert len(g_sparse) == len(g_dense)
+        for (k_s, v_s), (k_d, v_d) in zip(g_sparse, g_dense):
+            assert k_s == k_d
+            v_s, v_d = np.array(v_s), np.array(v_d)
+            scale = max(1.0, np.abs(v_d).max())
+            np.testing.assert_allclose(
+                v_s / scale, v_d / scale, atol=1e-5,
+                err_msg=f"weight grad mismatch at {k_s}",
+            )
+
+    def test_fp16_constants_converted(self):
+        """Both fp16 mechanisms must convert the sparse-path constants:
+        the production path (_convert_private_arrays) and the direct
+        Contraction.set_dtype override."""
+        from mace_mlx.model import _convert_private_arrays
+
+        # Production mechanism: set_dtype + _convert_private_arrays
+        sc, x, y = self._make("4x0e + 4x1o + 4x2e + 4x3o", "4x0e", 3)
+        assert any(c._use_sparse_main for c in sc.contractions)
+        sc.set_dtype(mx.float16)
+        _convert_private_arrays(sc, mx.float16)
+        for contr in sc.contractions:
+            if contr._use_sparse_main:
+                assert contr._sp_sel_i.dtype == mx.float16
+                assert contr._sp_sel_k.dtype == mx.float16
+                assert contr._sp_u_rows.dtype == mx.float16
+        out = sc(x.astype(mx.float16), y.astype(mx.float16))
+        assert out.dtype == mx.float16
+        assert bool(mx.all(mx.isfinite(out)))
+
+        # Direct per-module override
+        sc2, _, _ = self._make("4x0e + 4x1o + 4x2e + 4x3o", "4x0e", 3)
+        for contr in sc2.contractions:
+            contr.set_dtype(mx.float16)
+            if contr._use_sparse_main:
+                assert contr._sp_sel_i.dtype == mx.float16
+                assert contr._sp_u_rows.dtype == mx.float16
