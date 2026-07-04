@@ -580,6 +580,7 @@ class TestSparseMainPath:
         out_sparse = np.array(sc(x, y))
         for contr in sc.contractions:
             contr._use_sparse_main = False
+            contr._use_sparse_lower = False
         out_dense = np.array(sc(x, y))
         np.testing.assert_allclose(out_sparse, out_dense, atol=1e-5)
 
@@ -594,6 +595,7 @@ class TestSparseMainPath:
         g_sparse = np.array(mx.grad(loss)(x))
         for contr in sc.contractions:
             contr._use_sparse_main = False
+            contr._use_sparse_lower = False
         g_dense = np.array(mx.grad(loss)(x))
         scale = max(1.0, np.abs(g_dense).max())
         np.testing.assert_allclose(g_sparse / scale, g_dense / scale, atol=1e-5)
@@ -612,6 +614,7 @@ class TestSparseMainPath:
         g_sparse = nn.utils.tree_flatten(mx.grad(loss)(sc.parameters()))
         for contr in sc.contractions:
             contr._use_sparse_main = False
+            contr._use_sparse_lower = False
         g_dense = nn.utils.tree_flatten(mx.grad(loss)(sc.parameters()))
         assert len(g_sparse) == len(g_dense)
         for (k_s, v_s), (k_d, v_d) in zip(g_sparse, g_dense):

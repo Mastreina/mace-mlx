@@ -20,12 +20,143 @@ Performance notes:
 
 from __future__ import annotations
 
+import hashlib
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from mace_mlx.clebsch_gordan import wigner_3j
 from mace_mlx.irreps import Irrep, Irreps
+
+# --- Fused Metal kernels for the batched_mul21 conv_tp path ---------------
+# One forward kernel (threadgroup per edge, thread per channel u) produces
+# the output directly in final slot layout: the w_t transpose, M1 broadcast,
+# selector expansion, multiplies and 10-slot assembly all happen in
+# registers/threadgroup memory, eliminating ~3.4 GB of materialized
+# intermediates per 46k edges (medium). One 4-output backward kernel
+# computes dx1/dM1/dxs/dw in a single pass over the cotangent (in-kernel
+# recompute, simdgroup reductions); dx2 folds back through two small GEMMs.
+# Measured (M4 Pro, medium layer-1, E=46000): block fwd 9.3x, fwd+bwd 7.2x,
+# whole-step medium/Si1000 2.5x. Numerics vs the GEMM path: <=2.5e-7 rel.
+
+_METAL_MUL21_FWD_SRC = """
+    threadgroup float M1s[D1 * K1];
+    threadgroup float xss[K0];
+    uint e = threadgroup_position_in_grid.y;
+    uint u = thread_position_in_threadgroup.x;
+
+    for (uint t = u; t < D1 * K1; t += MUL) M1s[t] = (float)M1[e * (D1 * K1) + t];
+    for (uint t = u; t < K0; t += MUL)      xss[t] = (float)xs[e * K0 + t];
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    float x1v[D1];
+    for (uint m = 0; m < D1; ++m)
+        x1v[m] = (float)x1[e * X1DIM + SL_M21 + u * D1 + m];
+    float x1s = (float)x1[e * X1DIM + SL_SCAL + u];
+
+    for (uint s = 0; s < NSLOT_{sfx}; ++s) {{
+        float w_su = (float)w[e * WDIM + SLOT_INST_{sfx}[s] * MUL + u];
+        uint d = SLOT_D_{sfx}[s];
+        uint seg = SLOT_SEG_{sfx}[s];
+        uint base = e * OUTDIM + SLOT_OFF_{sfx}[s] + u * d;
+        if (SLOT_SCAL_{sfx}[s] != 0) {{
+            float a = x1s * w_su;
+            for (uint k = 0; k < d; ++k)
+                mji[base + k] = (T)(a * xss[seg + k]);
+        }} else {{
+            for (uint k = 0; k < d; ++k) {{
+                float acc = 0.0f;
+                for (uint m = 0; m < D1; ++m)
+                    acc += x1v[m] * M1s[m * K1 + seg + k];
+                mji[base + k] = (T)(w_su * acc);
+            }}
+        }}
+    }}
+"""
+
+_METAL_MUL21_BWD_SRC = """
+    threadgroup float M1s[D1 * K1];
+    threadgroup float xss[K0];
+    threadgroup float red[(MUL / 32) * D1 * DMAX];
+    uint e = threadgroup_position_in_grid.y;
+    uint u = thread_position_in_threadgroup.x;
+    uint simd_id = u / 32;
+
+    for (uint t = u; t < D1 * K1; t += MUL) M1s[t] = (float)M1[e * (D1 * K1) + t];
+    for (uint t = u; t < K0; t += MUL)      xss[t] = (float)xs[e * K0 + t];
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    float x1v[D1];
+    for (uint m = 0; m < D1; ++m)
+        x1v[m] = (float)x1[e * X1DIM + SL_M21 + u * D1 + m];
+    float x1s = (float)x1[e * X1DIM + SL_SCAL + u];
+
+    float dx1v[D1] = {{0.0f}};
+    float dx1s = 0.0f;
+
+    for (uint s = 0; s < NSLOT_{sfx}; ++s) {{
+        uint i = SLOT_INST_{sfx}[s];
+        float w_su = (float)w[e * WDIM + i * MUL + u];
+        uint d = SLOT_D_{sfx}[s];
+        uint seg = SLOT_SEG_{sfx}[s];
+        uint base = e * OUTDIM + SLOT_OFF_{sfx}[s] + u * d;
+
+        float g[DMAX];
+        for (uint k = 0; k < d; ++k) g[k] = (float)cot[base + k];
+
+        float dw_acc = 0.0f;
+        if (SLOT_SCAL_{sfx}[s] != 0) {{
+            float gx = 0.0f;
+            for (uint k = 0; k < d; ++k) {{
+                dw_acc += g[k] * x1s * xss[seg + k];
+                gx += g[k] * xss[seg + k];
+            }}
+            dx1s += w_su * gx;
+            for (uint k = 0; k < d; ++k) {{
+                float v = metal::simd_sum(g[k] * w_su * x1s);
+                if ((u & 31) == 0) red[simd_id * D1 * DMAX + k] = v;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            if (u < d) {{
+                float acc = 0.0f;
+                for (uint q = 0; q < MUL / 32; ++q)
+                    acc += red[q * D1 * DMAX + u];
+                dxs_out[e * K0 + seg + u] = (T)acc;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        }} else {{
+            for (uint k = 0; k < d; ++k) {{
+                float dot = 0.0f;
+                for (uint m = 0; m < D1; ++m)
+                    dot += x1v[m] * M1s[m * K1 + seg + k];
+                dw_acc += g[k] * dot;
+                for (uint m = 0; m < D1; ++m)
+                    dx1v[m] += g[k] * w_su * M1s[m * K1 + seg + k];
+            }}
+            for (uint m = 0; m < D1; ++m) {{
+                for (uint k = 0; k < d; ++k) {{
+                    float v = metal::simd_sum(g[k] * w_su * x1v[m]);
+                    if ((u & 31) == 0) red[simd_id * D1 * DMAX + m * d + k] = v;
+                }}
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+            if (u < D1 * d) {{
+                uint m = u / d, k = u % d;
+                float acc = 0.0f;
+                for (uint q = 0; q < MUL / 32; ++q)
+                    acc += red[q * D1 * DMAX + m * d + k];
+                dM1_out[e * (D1 * K1) + m * K1 + seg + k] = (T)acc;
+            }}
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        }}
+        dw_out[e * WDIM + i * MUL + u] = (T)dw_acc;
+    }}
+
+    for (uint m = 0; m < D1; ++m)
+        dx1_out[e * X1DIM + SL_M21 + u * D1 + m] = (T)dx1v[m];
+    dx1_out[e * X1DIM + SL_SCAL + u] = (T)dx1s;
+"""
 
 
 class Instruction:
@@ -297,6 +428,7 @@ class TensorProduct(nn.Module):
         # scatter-add. Measured on mpa0-medium layer 2: block forward ~3.4x,
         # full-gradient ~1.4x, whole-step ~1.2x.
         self._batched_mul21 = False
+        self._metal_mul21 = None
         if (
             not self._batched_uvu_scalar
             and len(self._instructions) > 1
@@ -313,6 +445,8 @@ class TensorProduct(nn.Module):
             )
         ):
             self._setup_batched_mul21()
+            if self._batched_mul21:
+                self._setup_metal_mul21()
 
     def _setup_batched_mul21(self) -> None:
         insts = self._instructions
@@ -440,6 +574,157 @@ class TensorProduct(nn.Module):
         out = mx.concatenate(parts, axis=-1)
         return out.reshape(*batch_shape, out.shape[-1])
 
+    def _setup_metal_mul21(self) -> None:
+        """Build the fused Metal kernels for the batched_mul21 path.
+
+        GPU-only fast path on top of _batched_mul21 (guards below fall back
+        to the GEMM path). Sets self._metal_mul21 to a custom_function
+        (x1, x2, w) -> mji or leaves it None.
+        """
+        insts = self._instructions
+        n = self._bm21_n
+        mul, d1 = self._bm21_mul, self._bm21_d1
+        K0, K1 = self._bm21_K0, self._bm21_K1
+        # Kernel assumptions: a scalar group exists, threadgroup = mul
+        # (simd_sum reductions need mul % 32 == 0; Apple GPUs cap
+        # threadgroups at 1024).
+        if self._bm21_S is None or mul % 32 != 0 or mul > 1024:
+            return
+        sl_scal, sl_m21 = self._bm21_sl_scal, self._bm21_sl_m21
+        x1dim = self.irreps_in1.dim
+        # dx1 is written only through the two source slices; they must tile
+        # the x1 row exactly or backward would leave uninitialized gaps.
+        spans = sorted(
+            [(sl_scal.start, sl_scal.stop), (sl_m21.start, sl_m21.stop)]
+        )
+        if (
+            spans[0][0] != 0
+            or spans[0][1] != spans[1][0]
+            or spans[1][1] != x1dim
+        ):
+            return
+
+        # Per-slot metadata in output-slot order (same segment offsets as
+        # _setup_batched_mul21 builds for scal_segs/m21_segs).
+        scal_set = {i for i in range(n) if self._cg_scalars[i] is not None}
+        seg = {}
+        off = 0
+        for i in range(n):
+            if i in scal_set:
+                seg[i] = off
+                off += insts[i].ir_out_dim
+        off = 0
+        for i in range(n):
+            if i not in scal_set:
+                seg[i] = off
+                off += insts[i].ir_out_dim
+        slot_order = sorted(range(n), key=lambda i: insts[i].i_out)
+        slots = []
+        outdim = 0
+        for i in slot_order:
+            d = insts[i].ir_out_dim
+            slots.append(
+                dict(inst=i, scal=(i in scal_set), seg=seg[i], d=d, off=outdim)
+            )
+            outdim += mul * d
+        if outdim != self.irreps_out.dim:
+            return
+        dmax = max(s["d"] for s in slots)
+        wdim = n * mul
+
+        # Constants are read by the compiled graph via closure over self;
+        # materialize them now (MLX 0.31.2 reads garbage from lazy derived
+        # arrays captured before their first eval).
+        mx.eval(self._bm21_G1, self._bm21_S)
+
+        cfg = (
+            f"{mul}_{d1}_{K0}_{K1}_{n}_{outdim}_{x1dim}"
+            f"_{sl_scal.start}_{sl_m21.start}"
+            + str([tuple(sorted(s.items())) for s in slots])
+        )
+        sfx = hashlib.md5(cfg.encode()).hexdigest()[:8]
+        arr = lambda key: ", ".join(str(int(s[key])) for s in slots)
+        header = f"""
+constant uint NSLOT_{sfx} = {n};
+constant uint SLOT_INST_{sfx}[{n}] = {{{arr('inst')}}};
+constant uint SLOT_SCAL_{sfx}[{n}] = {{{", ".join("1" if s["scal"] else "0" for s in slots)}}};
+constant uint SLOT_SEG_{sfx}[{n}]  = {{{arr('seg')}}};
+constant uint SLOT_D_{sfx}[{n}]    = {{{arr('d')}}};
+constant uint SLOT_OFF_{sfx}[{n}]  = {{{arr('off')}}};
+"""
+        k_fwd = mx.fast.metal_kernel(
+            name=f"mul21_fwd_{sfx}",
+            input_names=["x1", "M1", "xs", "w"],
+            output_names=["mji"],
+            source=_METAL_MUL21_FWD_SRC.format(sfx=sfx),
+            header=header,
+        )
+        k_bwd = mx.fast.metal_kernel(
+            name=f"mul21_bwd_{sfx}",
+            input_names=["cot", "x1", "M1", "xs", "w"],
+            output_names=["dx1_out", "dM1_out", "dxs_out", "dw_out"],
+            source=_METAL_MUL21_BWD_SRC.format(sfx=sfx),
+            header=header,
+        )
+        tmpl = [
+            ("MUL", mul), ("D1", d1), ("K0", K0), ("K1", K1),
+            ("X1DIM", x1dim), ("WDIM", wdim), ("OUTDIM", outdim),
+            ("SL_SCAL", sl_scal.start), ("SL_M21", sl_m21.start),
+            ("DMAX", dmax),
+        ]
+
+        # G1/S are read from self at call time so dtype conversion
+        # (set_dtype/_convert_private_arrays) is picked up; only Python
+        # object references are closed over, not mx.arrays.
+        @mx.custom_function
+        def fused_mul21(x1, x2, w):
+            E = x1.shape[0]
+            M1 = x2 @ self._bm21_G1
+            xs = x2 @ self._bm21_S
+            return k_fwd(
+                inputs=[x1, M1, xs, w],
+                template=[("T", x1.dtype)] + tmpl,
+                grid=(mul, E, 1),
+                threadgroup=(mul, 1, 1),
+                output_shapes=[(E, outdim)],
+                output_dtypes=[x1.dtype],
+            )[0]
+
+        @fused_mul21.vjp
+        def _fused_mul21_vjp(primals, cotan, output):
+            x1, x2, w = primals
+            E = x1.shape[0]
+            M1 = x2 @ self._bm21_G1
+            xs = x2 @ self._bm21_S
+            dx1, dM1, dxs, dw = k_bwd(
+                inputs=[cotan, x1, M1, xs, w],
+                template=[("T", x1.dtype)] + tmpl,
+                grid=(mul, E, 1),
+                threadgroup=(mul, 1, 1),
+                output_shapes=[
+                    (E, x1dim), (E, d1 * K1), (E, K0), (E, wdim)
+                ],
+                output_dtypes=[x1.dtype] * 4,
+            )
+            dx2 = dM1 @ self._bm21_G1.T + dxs @ self._bm21_S.T
+            return dx1, dx2, dw
+
+        self._metal_mul21 = fused_mul21
+
+    def _metal_mul21_forward(
+        self, x1: mx.array, x2: mx.array, weight: mx.array
+    ) -> mx.array:
+        batch_shape = x1.shape[:-1]
+        E = 1
+        for s in batch_shape:
+            E *= s
+        out = self._metal_mul21(
+            x1.reshape(E, x1.shape[-1]),
+            x2.reshape(E, x2.shape[-1]),
+            weight.reshape(E, weight.shape[-1]),
+        )
+        return out.reshape(*batch_shape, out.shape[-1])
+
     @property
     def weight_numel(self) -> int:
         """Total number of weight parameters needed (for external weights)."""
@@ -463,6 +748,12 @@ class TensorProduct(nn.Module):
         """
         if self._batched_uvu_scalar and weight is not None:
             return self._batched_forward(x1, x2, weight)
+        if (
+            self._metal_mul21 is not None
+            and weight is not None
+            and mx.default_device().type == mx.DeviceType.gpu
+        ):
+            return self._metal_mul21_forward(x1, x2, weight)
         if self._batched_mul21 and weight is not None:
             return self._batched_mul21_forward(x1, x2, weight)
         return self._loop_forward(x1, x2, weight)

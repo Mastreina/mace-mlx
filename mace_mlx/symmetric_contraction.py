@@ -36,6 +36,61 @@ from mace_mlx.irreps import Irrep, Irreps
 
 ALPHABET = ["w", "x", "v", "n", "z", "r", "t", "y", "u", "o", "p", "s"]
 
+# --- Fused Metal kernels for the sparse-main X construction (GPU only) ----
+# X[b,c,r] = f[b,c,i_r] * W[b,c,k_r] as one dual-gather+multiply kernel
+# instead of two selector GEMMs + multiply (three materializations).
+# Backward: df/dW as separate CSR-grouped kernels (no atomics); the dW
+# kernel is a dead node under lazy eval for force-only workloads.
+# The kernel objects are module-level; template ints specialize per shape.
+
+_SCX_FWD_SRC = """
+    uint elem = thread_position_in_grid.x;      // bc * NROW + r
+    uint r = elem % NROW;
+    uint bc = elem / NROW;
+    X[elem] = (T)((float)f[bc * IDIM + idx_i[r]] * (float)w[bc * KDIM + idx_k[r]]);
+"""
+
+_SCX_DF_SRC = """
+    uint elem = thread_position_in_grid.x;      // bc * IDIM + i
+    uint i = elem % IDIM;
+    uint bc = elem / IDIM;
+    float acc = 0.0f;
+    for (uint s = starts_i[i]; s < starts_i[i + 1]; ++s) {
+        uint r = rows_by_i[s];
+        acc += (float)dX[bc * NROW + r] * (float)w[bc * KDIM + idx_k[r]];
+    }
+    df[elem] = (T)acc;
+"""
+
+_SCX_DW_SRC = """
+    uint elem = thread_position_in_grid.x;      // bc * KDIM + k
+    uint k = elem % KDIM;
+    uint bc = elem / KDIM;
+    float acc = 0.0f;
+    for (uint s = starts_k[k]; s < starts_k[k + 1]; ++s) {
+        uint r = rows_by_k[s];
+        acc += (float)dX[bc * NROW + r] * (float)f[bc * IDIM + idx_i[r]];
+    }
+    dw[elem] = (T)acc;
+"""
+
+_scx_k_fwd = mx.fast.metal_kernel(
+    name="scx_fused_fwd", input_names=["f", "w", "idx_i", "idx_k"],
+    output_names=["X"], source=_SCX_FWD_SRC,
+)
+_scx_k_df = mx.fast.metal_kernel(
+    name="scx_fused_df",
+    input_names=["dX", "w", "idx_k", "rows_by_i", "starts_i"],
+    output_names=["df"], source=_SCX_DF_SRC,
+)
+_scx_k_dw = mx.fast.metal_kernel(
+    name="scx_fused_dw",
+    input_names=["dX", "f", "idx_i", "rows_by_k", "starts_k"],
+    output_names=["dw"], source=_SCX_DW_SRC,
+)
+
+_SCX_TG = (256, 1, 1)
+
 
 def _build_einsum_strings(
     correlation: int, ir_out_lmax: int
@@ -231,8 +286,13 @@ class Contraction(nn.Module):
 
         # --- Sparse main contraction setup ---
         self._use_sparse_main = False
+        self._metal_scx = None
+        self._use_sparse_lower = False
         if self._use_unrolled:
             self._setup_sparse_main()
+            if self._use_sparse_main:
+                self._setup_metal_scx()
+            self._setup_sparse_lower()
 
     def _setup_sparse_main(self) -> None:
         """Precompute the (i,k)-row-compressed form of the main U tensor.
@@ -267,6 +327,109 @@ class Contraction(nn.Module):
         # eval (MLX 0.31.2, see docs/prototypes/sparse_sc_results.md).
         mx.eval(self._sp_sel_i, self._sp_sel_k, self._sp_u_rows)
         self._use_sparse_main = True
+
+    def _setup_metal_scx(self) -> None:
+        """Fused Metal kernel form of the X construction (GPU fast path).
+
+        Derives the (i_r, k_r) index tables and CSR groupings from the
+        production SelI/SelK selector matrices and builds a custom_function
+        (f, W) -> X with hand-written df/dW kernels. Falls back to the
+        selector-GEMM form off-GPU (dispatch checks the device at call
+        time; the constants here are integer tables, unaffected by dtype
+        conversion).
+        """
+        sel_i = np.array(self._sp_sel_i)  # (i_dim, nrow)
+        sel_k = np.array(self._sp_sel_k)  # (k_dim, nrow)
+        i_dim, nrow = sel_i.shape
+        k_dim = sel_k.shape[0]
+        i_of_r = sel_i.argmax(axis=0).astype(np.uint32)
+        k_of_r = sel_k.argmax(axis=0).astype(np.uint32)
+
+        def csr(idx, dim):
+            order = np.argsort(idx, kind="stable").astype(np.uint32)
+            starts = np.searchsorted(idx[order], np.arange(dim + 1)).astype(
+                np.uint32
+            )
+            return mx.array(order), mx.array(starts)
+
+        idx_i = mx.array(i_of_r)
+        idx_k = mx.array(k_of_r)
+        rows_by_i, starts_i = csr(i_of_r, i_dim)
+        rows_by_k, starts_k = csr(k_of_r, k_dim)
+        mx.eval(idx_i, idx_k, rows_by_i, starts_i, rows_by_k, starts_k)
+
+        tmpl = [("NROW", nrow), ("IDIM", i_dim), ("KDIM", k_dim)]
+
+        @mx.custom_function
+        def fused_x(f, w):
+            b, c = f.shape[0], f.shape[1]
+            return _scx_k_fwd(
+                inputs=[f, w, idx_i, idx_k],
+                template=[("T", f.dtype)] + tmpl,
+                grid=(b * c * nrow, 1, 1), threadgroup=_SCX_TG,
+                output_shapes=[(b, c, nrow)], output_dtypes=[f.dtype],
+            )[0]
+
+        @fused_x.vjp
+        def _fused_x_vjp(primals, cotan, output):
+            f, w = primals
+            b, c = f.shape[0], f.shape[1]
+            df = _scx_k_df(
+                inputs=[cotan, w, idx_k, rows_by_i, starts_i],
+                template=[("T", f.dtype)] + tmpl,
+                grid=(b * c * i_dim, 1, 1), threadgroup=_SCX_TG,
+                output_shapes=[(b, c, i_dim)], output_dtypes=[f.dtype],
+            )[0]
+            dw = _scx_k_dw(
+                inputs=[cotan, f, idx_i, rows_by_k, starts_k],
+                template=[("T", f.dtype)] + tmpl,
+                grid=(b * c * k_dim, 1, 1), threadgroup=_SCX_TG,
+                output_shapes=[(b, c, k_dim)], output_dtypes=[f.dtype],
+            )[0]
+            return df, dw
+
+        self._metal_scx = fused_x
+
+    def _setup_sparse_lower(self) -> None:
+        """Distributive rewrite of the lower-order steps.
+
+        Each iteration computes (W @ U_t + out)_4d @ f. By distributivity
+        this splits into RC(W, f) + out_4d @ f, where the RC term is the
+        same row-compressed bilinear form as the sparse main step, built
+        over U_lower's nonzero (k, i) pairs (real MACE lower U tensors
+        have only ~1-24 such pairs). This removes the (b, c, prefix)
+        c_tensor materialization and moves the add from prefix down to
+        prefix_outer. Enabled only when every iteration is sparse enough.
+        """
+        if self._unrolled_n_lower == 0:
+            return
+        sel_i_l, sel_k_l, u_rows_l, meta = [], [], [], []
+        for idx in range(self._unrolled_n_lower):
+            U2t = np.array(self._u_lower_2d_t[idx])  # (k, prefix)
+            k_l = U2t.shape[0]
+            i_d = self._unrolled_lower_i_dims[idx]
+            po = self._unrolled_lower_prefix_sizes[idx] // i_d
+            U3 = U2t.reshape(k_l, po, i_d)
+            k_r, i_r = np.nonzero(np.abs(U3).max(axis=1) > 1e-12)
+            nnz = len(k_r)
+            if nnz == 0 or nnz > 0.5 * k_l * i_d:
+                return  # all-zero or not sparse enough: keep dense chain
+            sel_k = np.zeros((k_l, nnz), dtype=np.float32)
+            sel_k[k_r, np.arange(nnz)] = 1.0
+            sel_i = np.zeros((i_d, nnz), dtype=np.float32)
+            sel_i[i_r, np.arange(nnz)] = 1.0
+            u_rows = U3[k_r, :, i_r].astype(np.float32)  # (nnz, po)
+            sel_i_l.append(mx.stop_gradient(mx.array(sel_i)))
+            sel_k_l.append(mx.stop_gradient(mx.array(sel_k)))
+            u_rows_l.append(mx.stop_gradient(mx.array(u_rows)))
+            meta.append((po, i_d))
+        mx.eval(*sel_i_l, *sel_k_l, *u_rows_l)  # lazy-capture defense
+        # Parallel lists (not tuples) so dtype conversion reaches them.
+        self._sp_lower_sel_i = sel_i_l
+        self._sp_lower_sel_k = sel_k_l
+        self._sp_lower_u_rows = u_rows_l
+        self._sp_lower_meta = meta
+        self._use_sparse_lower = True
 
     def _ensure_weight_caches(self):
         """Lazily recompute pre-transposed+reshaped weight caches when weights change."""
@@ -305,6 +468,12 @@ class Contraction(nn.Module):
             self._sp_sel_i = self._sp_sel_i.astype(dtype)
             self._sp_sel_k = self._sp_sel_k.astype(dtype)
             self._sp_u_rows = self._sp_u_rows.astype(dtype)
+        if self._use_sparse_lower:
+            self._sp_lower_sel_i = [u.astype(dtype) for u in self._sp_lower_sel_i]
+            self._sp_lower_sel_k = [u.astype(dtype) for u in self._sp_lower_sel_k]
+            self._sp_lower_u_rows = [
+                u.astype(dtype) for u in self._sp_lower_u_rows
+            ]
 
     def __call__(self, features: mx.array, element_onehot: mx.array) -> mx.array:
         """Forward pass: recursive contraction using matmul decomposition.
@@ -361,7 +530,13 @@ class Contraction(nn.Module):
         if self._use_sparse_main:
             # Row-compressed bilinear form over U's nonzero (i,k) pairs:
             # X[b,c,r] = f[b,c,i_r] * W[b,c,k_r], out = X @ U_rows.
-            X = (features @ self._sp_sel_i) * (W_sel_ck @ self._sp_sel_k)
+            if (
+                self._metal_scx is not None
+                and mx.default_device().type == mx.DeviceType.gpu
+            ):
+                X = self._metal_scx(features, W_sel_ck)
+            else:
+                X = (features @ self._sp_sel_i) * (W_sel_ck @ self._sp_sel_k)
             out = X @ self._sp_u_rows  # (b,c,prefix)
         else:
             # Dense fallback: contract k with U, then i with features.
@@ -373,6 +548,27 @@ class Contraction(nn.Module):
             out = (WU @ feat_col).reshape(b, num_c, prefix_size)
 
         # --- Lower-order iterations (unrolled) ---
+        if self._use_sparse_lower:
+            # Distributive form: (W@U_t + out)_4d @ f = RC(W,f) + out_4d @ f
+            # with the RC term row-compressed over U_lower's (k,i) pairs.
+            # No (b,c,prefix) c_tensor is materialized and the add happens
+            # at prefix_outer instead of prefix.
+            for idx in range(n_lower):
+                k_i = self.weights[idx].shape[1]
+                W_sel_i = (element_onehot @ self._W_lower_ck[idx]).reshape(
+                    b, num_c, k_i
+                )
+                po, i_d = self._sp_lower_meta[idx]
+                Xl = (features @ self._sp_lower_sel_i[idx]) * (
+                    W_sel_i @ self._sp_lower_sel_k[idx]
+                )
+                rc = Xl @ self._sp_lower_u_rows[idx]  # (b,c,po)
+                coup = (out.reshape(b, num_c, po, i_d) @ feat_col).reshape(
+                    b, num_c, po
+                )
+                out = rc + coup
+            return out.reshape(b, -1)
+
         u_lower_t = self._u_lower_2d_t
         lower_prefix_sizes = self._unrolled_lower_prefix_sizes
         lower_i_dims = self._unrolled_lower_i_dims

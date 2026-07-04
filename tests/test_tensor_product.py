@@ -398,3 +398,58 @@ class TestEquivariance:
             atol=1e-4,
             err_msg="TP(D@x1, D@x2) should equal D@TP(x1, x2)",
         )
+
+
+class TestMetalMul21:
+    """Fused Metal kernel path must match the GEMM (batched_mul21) path."""
+
+    def _load_tp(self):
+        from pathlib import Path
+
+        import pytest as _pytest
+
+        from mace_mlx.model import load_model
+
+        cache = Path.home() / ".cache" / "mace_mlx" / "medium-mpa-0" / "v2"
+        if not cache.exists():
+            _pytest.skip("medium-mpa-0 cache not available")
+        if mx.default_device().type != mx.DeviceType.gpu:
+            _pytest.skip("Metal kernels are GPU-only")
+        model = load_model(str(cache))
+        tp = model.interactions[1].conv_tp
+        if tp._metal_mul21 is None:
+            _pytest.skip("metal_mul21 not active for this layout")
+        return tp
+
+    def test_forward_and_grads_match_gemm(self):
+        tp = self._load_tp()
+        rng = np.random.default_rng(3)
+        E = 512
+        x1 = mx.array(rng.normal(size=(E, tp.irreps_in1.dim)).astype(np.float32))
+        x2 = mx.array(rng.normal(size=(E, tp.irreps_in2.dim)).astype(np.float32))
+        w = mx.array(
+            rng.normal(size=(E, tp.weight_numel)).astype(np.float32) * 0.3
+        )
+
+        out_metal = tp(x1, x2, w)
+
+        def loss(a, b, c):
+            return (tp(a, b, c) ** 2).sum()
+
+        g_metal = mx.grad(loss, argnums=(0, 1, 2))(x1, x2, w)
+
+        fused = tp._metal_mul21
+        try:
+            tp._metal_mul21 = None
+            out_gemm = tp(x1, x2, w)
+            g_gemm = mx.grad(loss, argnums=(0, 1, 2))(x1, x2, w)
+        finally:
+            tp._metal_mul21 = fused
+
+        np.testing.assert_allclose(
+            np.array(out_metal), np.array(out_gemm), atol=1e-5
+        )
+        for gm, gg in zip(g_metal, g_gemm):
+            gm, gg = np.array(gm), np.array(gg)
+            scale = max(1.0, np.abs(gg).max())
+            np.testing.assert_allclose(gm / scale, gg / scale, atol=1e-5)
