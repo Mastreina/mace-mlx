@@ -284,6 +284,162 @@ class TensorProduct(nn.Module):
                     for inst in self._instructions
                 ]
 
+        # Batched mul2=1 fast path ("x2-first" contraction reordering).
+        # Applies to the second-layer conv_tp of L>0 models (mixed 0e+1o node
+        # features): all instructions are uvu / has_weight / mul2=1 with a
+        # common multiplicity, each classified as either cg-scalar (0e source)
+        # or cg_mul2_1 (l>0 source). Instead of one matmul chain per
+        # instruction, x2 is contracted with the (path-weighted) CG constants
+        # FIRST — producing a small (E, d1, K1) matrix with no mul factor —
+        # followed by a single batched matmul against the l>0 source block.
+        # Weight expansion uses constant 0/1 selector GEMMs rather than
+        # mx.take so the VJP is a transposed GEMM (segment-sum) instead of a
+        # scatter-add. Measured on mpa0-medium layer 2: block forward ~3.4x,
+        # full-gradient ~1.4x, whole-step ~1.2x.
+        self._batched_mul21 = False
+        if (
+            not self._batched_uvu_scalar
+            and len(self._instructions) > 1
+            and not internal_weights
+            and all(
+                inst.connection_mode == "uvu"
+                and inst.has_weight
+                and inst.mul2 == 1
+                and inst.mul1 == self._instructions[0].mul1
+                and inst.weight_shape == (inst.mul1, 1)
+                and (self._cg_scalars[i] is not None
+                     or self._cg_mul2_1[i] is not None)
+                for i, inst in enumerate(self._instructions)
+            )
+        ):
+            self._setup_batched_mul21()
+
+    def _setup_batched_mul21(self) -> None:
+        insts = self._instructions
+        n = len(insts)
+        i_outs = [inst.i_out for inst in insts]
+        # Require unique i_out covering every output slot (true for the
+        # conv_tp layouts produced by tp_out_irreps_with_instructions).
+        if len(set(i_outs)) != n or n != len(self.irreps_out):
+            return
+
+        scal = [i for i in range(n) if self._cg_scalars[i] is not None]
+        m21 = [i for i in range(n) if self._cg_scalars[i] is None]
+        if not m21:
+            return
+        # Single source block per group; uniform ir1_dim in the m21 group.
+        if len({insts[i].i_in1 for i in m21}) != 1:
+            return
+        if scal and len({insts[i].i_in1 for i in scal}) != 1:
+            return
+        d1 = insts[m21[0]].ir1_dim
+        if any(insts[i].ir1_dim != d1 for i in m21):
+            return
+
+        sl1 = self.irreps_in1.slices
+        sl2 = self.irreps_in2.slices
+        x2_dim = self.irreps_in2.dim
+        mul = insts[0].mul1
+
+        K0 = sum(insts[i].ir_out_dim for i in scal)
+        K1 = sum(insts[i].ir_out_dim for i in m21)
+
+        # Scalar group: out0 = x1_0e * (w @ T0) * (x2 @ S)
+        S = np.zeros((x2_dim, K0), dtype=np.float32)
+        scal_segs = {}
+        ids0 = []
+        off = 0
+        for i in scal:
+            inst = insts[i]
+            s2 = sl2[inst.i_in2].start
+            c = self._cg_scalars[i] * inst.path_weight
+            for k in range(inst.ir_out_dim):
+                S[s2 + k, off + k] = c
+            scal_segs[i] = (off, inst.ir_out_dim)
+            ids0 += [i] * inst.ir_out_dim
+            off += inst.ir_out_dim
+
+        # mul2_1 group: M1 = (x2 @ G1).reshape(E, d1, K1); out1 = x1_l @ M1
+        G1 = np.zeros((x2_dim, d1 * K1), dtype=np.float32)
+        m21_segs = {}
+        ids1 = []
+        off = 0
+        for i in m21:
+            inst = insts[i]
+            s2 = sl2[inst.i_in2].start
+            cg = np.array(self._cg_tensors[i])  # (d1, d2, do)
+            pw = inst.path_weight
+            do = inst.ir_out_dim
+            for m in range(d1):
+                for j in range(inst.ir2_dim):
+                    for k in range(do):
+                        G1[s2 + j, m * K1 + off + k] = cg[m, j, k] * pw
+            m21_segs[i] = (off, do)
+            ids1 += [i] * do
+            off += do
+
+        # 0/1 selector matrices: weight expansion as GEMM (VJP = segment-sum)
+        T0 = np.zeros((n, K0), dtype=np.float32)
+        for col, i in enumerate(ids0):
+            T0[i, col] = 1.0
+        T1 = np.zeros((n, K1), dtype=np.float32)
+        for col, i in enumerate(ids1):
+            T1[i, col] = 1.0
+
+        self._batched_mul21 = True
+        self._bm21_n = n
+        self._bm21_mul = mul
+        self._bm21_d1 = d1
+        self._bm21_K0 = K0
+        self._bm21_K1 = K1
+        self._bm21_sl_scal = sl1[insts[scal[0]].i_in1] if scal else None
+        self._bm21_sl_m21 = sl1[insts[m21[0]].i_in1]
+        self._bm21_S = mx.stop_gradient(mx.array(S)) if scal else None
+        self._bm21_G1 = mx.stop_gradient(mx.array(G1))
+        self._bm21_T0 = mx.stop_gradient(mx.array(T0)) if scal else None
+        self._bm21_T1 = mx.stop_gradient(mx.array(T1))
+        # Output assembly: (is_scalar_group, segment offset, ir_out_dim)
+        # in output-slot order.
+        slot_order = sorted(range(n), key=lambda i: insts[i].i_out)
+        self._bm21_slots = [
+            (i in scal_segs,
+             (scal_segs[i][0] if i in scal_segs else m21_segs[i][0]),
+             insts[i].ir_out_dim)
+            for i in slot_order
+        ]
+
+    def _batched_mul21_forward(
+        self, x1: mx.array, x2: mx.array, weight: mx.array
+    ) -> mx.array:
+        batch_shape = x1.shape[:-1]
+        E = 1
+        for s in batch_shape:
+            E *= s
+        x1 = x1.reshape(E, x1.shape[-1])
+        x2 = x2.reshape(E, x2.shape[-1])
+        mul, d1 = self._bm21_mul, self._bm21_d1
+
+        # (E, n_inst*mul) -> (E, mul, n_inst)
+        w_t = weight.reshape(E, self._bm21_n, mul).transpose(0, 2, 1)
+
+        # l>0 group: x2-first contraction, then one batched matmul
+        M1 = (x2 @ self._bm21_G1).reshape(E, d1, self._bm21_K1)
+        x1_m = x1[:, self._bm21_sl_m21].reshape(E, mul, d1)
+        out1 = (x1_m @ M1) * (w_t @ self._bm21_T1)  # (E, mul, K1)
+
+        out0 = None
+        if self._bm21_S is not None:
+            xs = x2 @ self._bm21_S  # (E, K0)
+            x1_s = x1[:, self._bm21_sl_scal].reshape(E, mul, 1)
+            out0 = x1_s * (w_t @ self._bm21_T0) * xs[:, None, :]
+
+        parts = []
+        for is_scal, off, d in self._bm21_slots:
+            src = out0 if is_scal else out1
+            parts.append(src[:, :, off:off + d].reshape(E, mul * d))
+        out = mx.concatenate(parts, axis=-1)
+        return out.reshape(*batch_shape, out.shape[-1])
+
     @property
     def weight_numel(self) -> int:
         """Total number of weight parameters needed (for external weights)."""
@@ -307,6 +463,8 @@ class TensorProduct(nn.Module):
         """
         if self._batched_uvu_scalar and weight is not None:
             return self._batched_forward(x1, x2, weight)
+        if self._batched_mul21 and weight is not None:
+            return self._batched_mul21_forward(x1, x2, weight)
         return self._loop_forward(x1, x2, weight)
 
     def _batched_forward(
@@ -391,7 +549,7 @@ class TensorProduct(nn.Module):
 
         # Initialize output accumulator per irreps_out slot
         out_parts = [
-            mx.zeros((*batch_shape, mulir.mul * mulir.ir.dim))
+            mx.zeros((*batch_shape, mulir.mul * mulir.ir.dim), dtype=x1.dtype)
             for mulir in self.irreps_out
         ]
 
@@ -490,7 +648,10 @@ class TensorProduct(nn.Module):
             if cg_scalar is not None:
                 # ir1_dim==1, CG = c*I
                 if w is not None:
-                    if w.ndim == len(batch_shape) + 2:
+                    if inst.mul2 == 1:
+                        # v-dim is trivial: (..., u, 1) * (..., 1, k) broadcast
+                        wx2 = w * x2_block
+                    elif w.ndim == len(batch_shape) + 2:
                         wx2 = mx.einsum("...uv,...vk->...uk", w, x2_block)
                     else:
                         wx2 = mx.einsum("uv,...vk->...uk", w, x2_block)
@@ -705,36 +866,75 @@ class FullyConnectedTensorProduct(nn.Module):
                 inst.connection_mode == "uvw"
                 and inst.ir2_dim == 1
                 and inst.ir1_dim == inst.ir_out_dim
-                and self.tp._cg_scalars[idx] is not None
-                for idx, inst in enumerate(self.tp._instructions)
+                for inst in self.tp._instructions
             )
         ):
-            self._scalar_in2_fast = True
-            # Precompute scale per instruction: cg_scalar * path_weight
-            self._si2_scales = []
-            self._si2_inst_info = []
+            # For l (x) 0e -> l couplings the CG tensor's [:, 0, :] slice is
+            # c * identity for ALL l (wigner_3j(l,0,l) = I/sqrt(2l+1)), not
+            # just l=0 — check it directly instead of relying on
+            # tp._cg_scalars (which is only populated when ir1_dim == 1).
+            cg_diag_scales: list[float] = []
+            all_diag = True
             for idx, inst in enumerate(self.tp._instructions):
-                cg_s = self.tp._cg_scalars[idx]
-                scale = cg_s * inst.path_weight
-                self._si2_scales.append(scale)
-                self._si2_inst_info.append((
-                    inst.mul1, inst.mul2, inst.mul_out, inst.ir1_dim,
-                    inst.i_in1, inst.i_in2, inst.i_out,
-                ))
-            self._si2_out_dim = irreps_out.dim
-            self._si2_out_irreps = irreps_out
+                cg_m = np.array(self.tp._cg_tensors[idx])[:, 0, :]
+                c = float(cg_m[0, 0])
+                if not np.allclose(
+                    cg_m, c * np.eye(inst.ir1_dim), atol=1e-6
+                ):
+                    all_diag = False
+                    break
+                cg_diag_scales.append(c)
+
+            if all_diag:
+                self._scalar_in2_fast = True
+                # Precompute scale per instruction: cg_diag * path_weight
+                self._si2_scales = []
+                self._si2_inst_info = []
+                for idx, inst in enumerate(self.tp._instructions):
+                    scale = cg_diag_scales[idx] * inst.path_weight
+                    self._si2_scales.append(scale)
+                    self._si2_inst_info.append((
+                        inst.mul1, inst.mul2, inst.mul_out, inst.ir1_dim,
+                        inst.i_in1, inst.i_in2, inst.i_out,
+                    ))
+                self._si2_out_dim = irreps_out.dim
+                self._si2_out_irreps = irreps_out
+                # Lazily-built cache of transposed weight views (see
+                # _ensure_si2_weight_cache).
+                self._si2_W_vuw: list[mx.array] | None = None
+                self._si2_cached_wids: tuple | None = None
+
+    def _ensure_transposed_weight_cache(self) -> list[mx.array]:
+        """Cache (v, u*w)-reshaped views of the constant internal weights.
+
+        The lazy graph is rebuilt every step; without this cache the
+        transpose+reshape re-materializes a multi-MB weight copy per call.
+        The cached arrays are ordinary lazy arrays — MLX materializes them
+        once on first eval and reuses the buffer afterwards. Keyed by weight
+        identity so replacing the weights invalidates the cache.
+        """
+        wids = tuple(id(w) for w in self.tp.weights)
+        if getattr(self, "_wvuw_cached_ids", None) != wids:
+            cache = []
+            for W in self.tp.weights:
+                mul1, mul2, mul_out = W.shape
+                cache.append(
+                    mx.transpose(W, axes=(1, 0, 2)).reshape(mul2, mul1 * mul_out)
+                )
+            self._wvuw_cache = cache
+            self._wvuw_cached_ids = wids
+        return self._wvuw_cache
 
     def __call__(self, x1: mx.array, x2: mx.array) -> mx.array:
         if self._scalar_fctp_fast:
             # Scalar-only fast path: 2 matmuls instead of outer product + einsum.
             # result[...,w] = scale * sum_u sum_v x1[...,u] * x2[...,v] * W[u,v,w]
-            W = self.tp.weights[0]  # (u, v, w)
             u, w = self._scalar_fctp_u, self._scalar_fctp_w
             batch_shape = x1.shape[:-1]
             x1_flat = x1.reshape(-1, x1.shape[-1])
             x2_flat = x2.reshape(-1, x2.shape[-1])
             # Step 1: contract x2 over v dimension
-            W_vuw = mx.transpose(W, axes=(1, 0, 2)).reshape(-1, u * w)  # (v, u*w)
+            W_vuw = self._ensure_transposed_weight_cache()[0]  # (v, u*w)
             tmp = (x2_flat @ W_vuw).reshape(-1, u, w)  # (B, u, w)
             # Step 2: contract x1 over u dimension via batched matmul
             result = (x1_flat[:, None, :] @ tmp).squeeze(-2)  # (B, w)
@@ -765,6 +965,8 @@ class FullyConnectedTensorProduct(nn.Module):
         x1_flat = x1.reshape(batch_size, x1.shape[-1])
         x2_flat = x2.reshape(batch_size, x2.shape[-1])
 
+        w_cache = self._ensure_transposed_weight_cache()
+
         # Build output parts: one per output irrep slot
         num_out_slots = len(self._si2_out_irreps)
         out_parts: list[mx.array | None] = [None] * num_out_slots
@@ -772,7 +974,6 @@ class FullyConnectedTensorProduct(nn.Module):
         for idx in range(len(self._si2_scales)):
             scale = self._si2_scales[idx]
             mul1, mul2, mul_out, ir_dim, i_in1, i_in2, i_out = self._si2_inst_info[idx]
-            W = self.tp.weights[self.tp._weight_indices[idx]]  # (mul1, mul2, mul_out)
 
             # x1_block: (B, mul1, ir_dim)
             x1_block = x1_flat[:, slices_in1[i_in1]].reshape(batch_size, mul1, ir_dim)
@@ -780,7 +981,7 @@ class FullyConnectedTensorProduct(nn.Module):
             x2_block = x2_flat[:, slices_in2[i_in2]]
 
             # Step 1: sum_v x2[v] * W[u, v, w] -> (B, mul1, mul_out)
-            W_vuw = mx.transpose(W, axes=(1, 0, 2)).reshape(mul2, mul1 * mul_out)
+            W_vuw = w_cache[self.tp._weight_indices[idx]]  # (mul2, mul1*mul_out)
             tmp = (x2_block @ W_vuw).reshape(batch_size, mul1, mul_out)
 
             # Step 2: sum_u x1[u, m] * tmp[u, w] -> out[w, m]
@@ -806,6 +1007,8 @@ class FullyConnectedTensorProduct(nn.Module):
         for i in range(num_out_slots):
             if out_parts[i] is None:
                 mulir = self._si2_out_irreps[i]
-                out_parts[i] = mx.zeros((*batch_shape, mulir.mul * mulir.ir.dim))
+                out_parts[i] = mx.zeros(
+                    (*batch_shape, mulir.mul * mulir.ir.dim), dtype=x1.dtype
+                )
 
         return mx.concatenate(out_parts, axis=-1)

@@ -76,21 +76,28 @@ class EquivariantLinear(nn.Module):
         self.instructions = instructions
         self.weights = weights
 
-        # Detect scalar-only fast path: all irreps are l=0 (dim=1) and
-        # there is exactly one instruction mapping one input slot to one
-        # output slot.  In that case the forward pass collapses to a
-        # single matmul: output = path_weight * (x @ weight).
+        # Detect scalar-only fast path: exactly one instruction with l=0
+        # (dim=1) covering the single output slot. The forward collapses to
+        # a single matmul: output = path_weight * (x_block @ weight). The
+        # input may have extra (unused) irrep blocks — e.g. a readout from
+        # 128x0e+128x1o to 0e — in which case only the scalar block is
+        # sliced out.
         self._scalar_fast_path = False
         self._scalar_weight: mx.array | None = None
         if (
             len(instructions) == 1
             and instructions[0].ir_dim == 1
-            and len(self.irreps_in) == 1
             and len(self.irreps_out) == 1
         ):
             self._scalar_fast_path = True
             pw = instructions[0].path_weight
             self._scalar_path_weight = pw
+            in_slice = self.irreps_in.slices[instructions[0].i_in]
+            self._scalar_in_slice = (
+                None
+                if (in_slice.start == 0 and in_slice.stop == self.irreps_in.dim)
+                else in_slice
+            )
 
         # Detect multi-irrep matmul fast path: all instructions have the
         # same (mul_in, mul_out) and each maps a unique i_in to a unique
@@ -147,6 +154,7 @@ class EquivariantLinear(nn.Module):
             # but each matmul is just (B*ir_dim, mul_in) @ (mul_in, mul_out)
             # which is more efficient than einsum
             self._multi_irrep_matmul = True
+            self._mi_1to1 = True
             self._mi_mul_in = mul_in0
             self._mi_mul_out = mul_out0
             # Store slices and ir_dims for fast iteration
@@ -162,6 +170,12 @@ class EquivariantLinear(nn.Module):
                 for pw in self._mi_path_weights
             )
             self._mi_pw0 = self._mi_path_weights[0]
+            # Output-slot assembly info: instruction order is NOT guaranteed
+            # to match output-slot order, and some output slots may have no
+            # instruction at all — a plain concat would silently misplace
+            # blocks in those cases.
+            self._mi_i_outs = i_out_list
+            self._mi_1to1_identity = i_out_list == list(range(len(self.irreps_out)))
             return
 
         # Case (b): accumulation needed — group by i_out
@@ -204,6 +218,98 @@ class EquivariantLinear(nn.Module):
             # Store group info: for each i_out, which instruction indices
             self._mi_groups = dict(groups)
             self._mi_i_out_order = list(self.irreps_out.slices)
+            self._setup_grouped_gemm(instructions)
+
+    def _setup_grouped_gemm(self, instructions: list[_Instruction]) -> None:
+        """Set up the grouped-GEMM accumulate path.
+
+        When every output slot's contributing input blocks are contiguous
+        in the input layout, the per-instruction matmuls that accumulate
+        into one output slot collapse into a single GEMM:
+            sum_k x_k @ W_k == [x_1|...|x_g] @ concat([W_1;...;W_g], axis=0)
+        This turns e.g. 10 matmuls + 20 transposes + zeros/adds into
+        len(irreps_out) fatter GEMMs.
+        """
+        self._mi_grouped = False
+        slices_in = self.irreps_in.slices
+
+        plan = []  # per output slot: (idxs, in_start, in_stop, ir_dim, pw)
+        for i_out, (mul_out, ir_out) in enumerate(self.irreps_out):
+            idxs = self._mi_groups.get(i_out, [])
+            if not idxs:
+                plan.append((None, 0, 0, ir_out.dim, 1.0))
+                continue
+            # Members arrive in construction order (outer i_in loop), so
+            # their input slices are ascending; verify contiguity.
+            idxs = sorted(idxs, key=lambda i: slices_in[instructions[i].i_in].start)
+            member_slices = [slices_in[instructions[i].i_in] for i in idxs]
+            contiguous = all(
+                a.stop == b.start
+                for a, b in zip(member_slices, member_slices[1:])
+            )
+            if not contiguous:
+                return  # keep legacy accumulate path
+            pw = instructions[idxs[0]].path_weight
+            plan.append((
+                idxs,
+                member_slices[0].start,
+                member_slices[-1].stop,
+                instructions[idxs[0]].ir_dim,
+                pw,
+            ))
+
+        self._mi_grouped = True
+        self._mi_group_plan = plan
+        self._mi_grouped_w_cache: list[mx.array | None] | None = None
+        self._mi_grouped_w_ids: tuple | None = None
+
+    def _ensure_grouped_weights(self) -> list[mx.array | None]:
+        """Lazily build/refresh the per-group concatenated weight matrices."""
+        wids = tuple(id(w) for w in self.weights)
+        if self._mi_grouped_w_ids != wids:
+            cache: list[mx.array | None] = []
+            for idxs, _, _, _, _ in self._mi_group_plan:
+                if idxs is None:
+                    cache.append(None)
+                elif len(idxs) == 1:
+                    cache.append(self.weights[idxs[0]])
+                else:
+                    cache.append(
+                        mx.concatenate([self.weights[i] for i in idxs], axis=0)
+                    )
+            self._mi_grouped_w_cache = cache
+            self._mi_grouped_w_ids = wids
+        return self._mi_grouped_w_cache
+
+    def _grouped_forward(self, x: mx.array) -> mx.array:
+        """Accumulate path via one GEMM per output slot."""
+        batch_shape = x.shape[:-1]
+        batch_size = 1
+        for s in batch_shape:
+            batch_size *= s
+        mul_out = self._mi_mul_out
+        w_cat = self._ensure_grouped_weights()
+
+        out_parts = []
+        for slot, (idxs, start, stop, ir_dim, pw) in enumerate(self._mi_group_plan):
+            if idxs is None:
+                out_parts.append(
+                    mx.zeros((*batch_shape, mul_out * ir_dim), dtype=x.dtype)
+                )
+                continue
+            g_mul_in = (stop - start) // ir_dim
+            x_block = x[..., start:stop].reshape(batch_size, g_mul_in, ir_dim)
+            x_flat = x_block.transpose(0, 2, 1).reshape(
+                batch_size * ir_dim, g_mul_in
+            )
+            out_flat = x_flat @ w_cat[slot]  # (B*ir_dim, mul_out)
+            out_block = out_flat.reshape(batch_size, ir_dim, mul_out)
+            out_block = out_block.transpose(0, 2, 1).reshape(
+                *batch_shape, mul_out * ir_dim
+            )
+            out_parts.append(pw * out_block)
+
+        return mx.concatenate(out_parts, axis=-1)
 
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass.
@@ -216,6 +322,8 @@ class EquivariantLinear(nn.Module):
         """
         # Fast path: scalar-only with single instruction -> one matmul
         if self._scalar_fast_path:
+            if self._scalar_in_slice is not None:
+                x = x[..., self._scalar_in_slice]
             return (self._scalar_path_weight * x) @ self.weights[0]
 
         # Fast path: multi-irrep with matmul instead of einsum
@@ -236,6 +344,9 @@ class EquivariantLinear(nn.Module):
         This is equivalent but avoids the einsum overhead and enables
         better MLX kernel fusion.
         """
+        if getattr(self, "_mi_grouped", False):
+            return self._grouped_forward(x)
+
         batch_shape = x.shape[:-1]
         batch_size = 1
         for s in batch_shape:
@@ -268,23 +379,36 @@ class EquivariantLinear(nn.Module):
         if hasattr(self, '_mi_1to1') and not self._mi_1to1:
             return self._accumulate_groups(out_parts, batch_shape)
 
-        # 1-to-1 case: apply path_weight and concatenate in output order
-        if self._mi_uniform_pw:
-            result = mx.concatenate(out_parts, axis=-1)
-            return self._mi_pw0 * result
-        else:
-            scaled = []
-            for idx, part in enumerate(out_parts):
-                scaled.append(self._mi_path_weights[idx] * part)
+        # 1-to-1 case: apply path_weight and assemble in output-slot order
+        if self._mi_1to1_identity:
+            if self._mi_uniform_pw:
+                return self._mi_pw0 * mx.concatenate(out_parts, axis=-1)
+            scaled = [
+                self._mi_path_weights[idx] * part
+                for idx, part in enumerate(out_parts)
+            ]
             return mx.concatenate(scaled, axis=-1)
+
+        # Permuted or partial coverage: place each block into its output
+        # slot; slots with no instruction are zero-filled.
+        slots: list[mx.array | None] = [None] * len(self.irreps_out)
+        for idx, part in enumerate(out_parts):
+            slots[self._mi_i_outs[idx]] = self._mi_path_weights[idx] * part
+        for i, mulir in enumerate(self.irreps_out):
+            if slots[i] is None:
+                slots[i] = mx.zeros(
+                    (*batch_shape, mulir.mul * mulir.ir.dim), dtype=x.dtype
+                )
+        return mx.concatenate(slots, axis=-1)
 
     def _accumulate_groups(
         self, out_parts: list[mx.array], batch_shape: tuple
     ) -> mx.array:
         """Handle accumulation when multiple inputs map to the same output."""
         slices_out = self.irreps_out.slices
+        dtype = out_parts[0].dtype if out_parts else mx.float32
         result_parts: list[mx.array] = [
-            mx.zeros((*batch_shape, mulir.mul * mulir.ir.dim))
+            mx.zeros((*batch_shape, mulir.mul * mulir.ir.dim), dtype=dtype)
             for mulir in self.irreps_out
         ]
 
@@ -300,7 +424,7 @@ class EquivariantLinear(nn.Module):
         slices_in = self.irreps_in.slices
 
         out_parts: list[mx.array] = [
-            mx.zeros((*batch_shape, mulir.mul * mulir.ir.dim))
+            mx.zeros((*batch_shape, mulir.mul * mulir.ir.dim), dtype=x.dtype)
             for mulir in self.irreps_out
         ]
 

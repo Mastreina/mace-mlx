@@ -2,6 +2,16 @@
 
 Implements MACE and ScaleShiftMACE models with the same architecture
 as the PyTorch MACE, enabling direct weight transfer from trained models.
+
+Precision policy (matters for float16/bfloat16 inference):
+    The geometric front-end is always computed in float32 — positions,
+    edge vectors, lengths, spherical harmonics, radial basis, cutoff,
+    atomic baseline energies (E0), and the final energy accumulation.
+    Only the heavy per-edge/per-node feature path (interactions, products,
+    readouts) runs in the compute dtype. Casting absolute positions to
+    half precision before taking differences loses ~0.03 Å (fp16) to
+    ~0.25 Å (bf16) of resolution at typical cell sizes and corrupts
+    forces; computing edge vectors in float32 first avoids this.
 """
 
 from __future__ import annotations
@@ -25,9 +35,9 @@ from mace_mlx.blocks import (
     RealAgnosticResidualNonLinearInteractionBlock,
 )
 from mace_mlx.irreps import Irreps
-from mace_mlx.radial import RadialEmbeddingBlock
-from mace_mlx.spherical_harmonics import spherical_harmonics, _e3nn_rotation_matrix
-from mace_mlx.utils import get_edge_vectors_and_lengths, scatter_sum
+from mace_mlx.radial import RadialEmbeddingBlock, ZBLBasis
+from mace_mlx.spherical_harmonics import spherical_harmonics
+from mace_mlx.utils import get_edge_vectors_and_lengths, graph_sum
 
 
 class MACE(nn.Module):
@@ -43,7 +53,7 @@ class MACE(nn.Module):
        a. node_feats, sc = interaction(node_feats, node_attrs, edge_attrs, edge_feats, edge_index)
        b. node_feats = product(node_feats, node_attrs, sc)
        c. node_energy = readout(node_feats)
-    7. total_energy = e0 + sum(readout_energies)
+    7. total_energy = e0 + [pair_repulsion] + sum(readout_energies)
     """
 
     def __init__(
@@ -68,6 +78,7 @@ class MACE(nn.Module):
         edge_irreps: str | None = None,
         use_agnostic_product: bool = False,
         apply_cutoff: bool = True,
+        pair_repulsion: dict | None = None,
     ):
         super().__init__()
         self.r_max = r_max
@@ -80,6 +91,9 @@ class MACE(nn.Module):
         self.num_heads = len(self.heads)
         # Active head index (set by calculator or user)
         self._head_idx = 0
+
+        # Feature-path compute dtype; float32 unless load_model switches it.
+        self._compute_dtype = mx.float32
 
         if radial_MLP is None:
             radial_MLP = [64, 64, 64]
@@ -148,28 +162,15 @@ class MACE(nn.Module):
             apply_cutoff=apply_cutoff,
         )
         # Placeholder for atomic numbers (set by load_model via z_table).
-        # Required by AgnesiTransform to map one-hot -> covalent radii.
+        # Required by AgnesiTransform and ZBLBasis to map one-hot -> element.
         self._atomic_numbers: mx.array | None = None
 
-        # Precompute block-diagonal SH basis rotation matrix.
-        # Our spherical_harmonics uses standard m-ordering, while e3nn
-        # (and thus the trained MACE weights) uses a different ordering.
-        # This block-diagonal matrix rotates each l-block from standard
-        # to e3nn ordering. Applied once to the SH before the interaction
-        # blocks, so the TP and all downstream operations use e3nn basis.
-        import numpy as np
-        total_sh_dim = sh_irreps.dim
-        sh_rot_np = np.eye(total_sh_dim, dtype=np.float32)
-        offset = 0
-        for _, ir in sh_irreps:
-            d = ir.dim
-            if ir.l > 0:
-                D = _e3nn_rotation_matrix(ir.l).astype(np.float32)
-                # Store D.T: the forward pass computes edge_attrs @ _sh_rotation,
-                # and the correct basis change is Y @ D.T (cf. _to_e3nn_basis).
-                sh_rot_np[offset:offset+d, offset:offset+d] = D.T
-            offset += d
-        self._sh_rotation = mx.array(sh_rot_np)
+        # Optional ZBL pair repulsion (mpa-0/0b/0b2/0b3 family).
+        # pair_repulsion is a dict like {"p": 5, "a_exp": 0.3, "a_prefactor": 0.4543}.
+        if pair_repulsion:
+            self.pair_repulsion_fn = ZBLBasis(**pair_repulsion)
+        else:
+            self.pair_repulsion_fn = None
 
         # Resolve interaction block class
         use_nonlinear_interaction = (
@@ -298,27 +299,6 @@ class MACE(nn.Module):
             return result
         return result, None
 
-    def set_dtype(self, dtype, predicate=None):
-        """Override to also convert _sh_rotation (private attr)."""
-        super().set_dtype(dtype, predicate)
-        if hasattr(self, "_sh_rotation") and self._sh_rotation.dtype != dtype:
-            self._sh_rotation = self._sh_rotation.astype(dtype)
-
-    def set_fused_kernel(self, enabled: bool = True) -> None:
-        """Enable/disable fused Metal gather-TP-scatter kernels in all interaction blocks.
-
-        The Metal kernels eliminate intermediate tensor allocations in the
-        gather -> TensorProduct -> scatter hot path. Only effective for
-        scalar-only TP (hidden_irreps = Nx0e). No autograd support, so
-        this should be enabled for inference only.
-
-        Args:
-            enabled: True to enable, False to disable.
-        """
-        for inter in self.interactions:
-            if hasattr(inter, "set_fused_kernel"):
-                inter.set_fused_kernel(enabled)
-
     def _readout_select_head(self, readout_output: mx.array) -> mx.array:
         """Select the active head from readout output.
 
@@ -345,6 +325,118 @@ class MACE(nn.Module):
             return e0_output.squeeze(-1)
         return e0_output[:, self._head_idx]
 
+    # ------------------------------------------------------------------ #
+    # Shared forward machinery
+    # ------------------------------------------------------------------ #
+
+    def _edge_features(
+        self,
+        vectors: mx.array,
+        lengths: mx.array,
+        node_attrs: mx.array,
+        edge_index: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        """Spherical harmonics + radial embedding.
+
+        Computed in float32 (vectors/lengths precision), then cast to the
+        compute dtype for the interaction/product feature path. The SH are
+        produced directly in the e3nn basis (the basis change is folded into
+        the recursion's l=1 seed — the trained weights live in that basis).
+        """
+        edge_attrs = spherical_harmonics(
+            self.max_ell, vectors, normalize=True, normalization="component",
+            basis="e3nn",
+        )
+        edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
+
+        dt = self._compute_dtype
+        if dt != mx.float32:
+            edge_attrs = edge_attrs.astype(dt)
+            edge_feats = edge_feats.astype(dt)
+            if cutoff is not None:
+                cutoff = cutoff.astype(dt)
+        return edge_attrs, edge_feats, cutoff
+
+    def _pair_energy(
+        self,
+        lengths: mx.array,
+        node_attrs: mx.array,
+        edge_index: mx.array,
+    ) -> mx.array | None:
+        """Per-node ZBL pair repulsion energy (float32), or None."""
+        if self.pair_repulsion_fn is None:
+            return None
+        return self.pair_repulsion_fn(
+            lengths, node_attrs, edge_index, self._atomic_numbers
+        )
+
+    def _run_layers(
+        self,
+        node_attrs: mx.array,
+        edge_attrs: mx.array,
+        edge_feats: mx.array,
+        edge_index: mx.array,
+        cutoff: mx.array | None,
+    ) -> list[mx.array]:
+        """Interaction/product stack + readouts -> per-layer node energies."""
+        node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
+
+        node_feats_list = []
+        for i in range(self.num_interactions):
+            node_feats, sc = self.interactions[i](
+                node_feats, node_attrs, edge_attrs, edge_feats, edge_index,
+                cutoff=cutoff,
+            )
+            node_feats = self.products[i](node_feats, node_attrs, sc=sc)
+            node_feats_list.append(node_feats)
+
+        node_es_list = []
+        for i, readout in enumerate(self.readouts):
+            feat_idx = -1 if len(self.readouts) == 1 else i
+            if hasattr(readout, '_num_heads') and readout._num_heads > 1:
+                raw = readout(node_feats_list[feat_idx], head_idx=self._head_idx)
+            else:
+                raw = readout(node_feats_list[feat_idx])
+            node_es_list.append(self._readout_select_head(raw))
+        return node_es_list
+
+    def _forward_core(
+        self,
+        vectors: mx.array,
+        lengths: mx.array,
+        node_attrs: mx.array,
+        edge_index: mx.array,
+        batch: mx.array,
+        num_graphs: int,
+    ) -> tuple[mx.array, mx.array, dict]:
+        """Shared forward: (per-graph energy, node_energy, extra outputs)."""
+        node_attrs = mx.stop_gradient(node_attrs)
+
+        node_e0 = self._e0_select_head(self.atomic_energies_fn(node_attrs))
+        pair_e = self._pair_energy(lengths, node_attrs, edge_index)
+
+        edge_attrs, edge_feats, cutoff = self._edge_features(
+            vectors, lengths, node_attrs, edge_index
+        )
+        node_es_list = self._run_layers(
+            node_attrs, edge_attrs, edge_feats, edge_index, cutoff
+        )
+
+        # Accumulate energies (float32 upcast for numerical stability).
+        # Plain MACE: pair repulsion enters unscaled, alongside e0.
+        all_es = [node_e0]
+        if pair_e is not None:
+            all_es.append(pair_e)
+        all_es.extend(node_es_list)
+        node_energy = mx.stack(
+            [e.astype(mx.float32) for e in all_es], axis=0
+        ).sum(axis=0)
+
+        energy = graph_sum(
+            node_energy[:, None], batch, num_graphs
+        ).squeeze(-1)
+        return energy, node_energy, {}
+
     def __call__(
         self,
         positions: mx.array,
@@ -358,16 +450,17 @@ class MACE(nn.Module):
         """Forward pass.
 
         Args:
-            positions: (num_atoms, 3) atom positions
+            positions: (num_atoms, 3) atom positions (float32)
             node_attrs: (num_atoms, num_elements) one-hot encoding
             edge_index: (2, num_edges) [senders, receivers]
-            shifts: (num_edges, 3) periodic shift vectors
-            cell: (3, 3) unit cell or None
+            shifts: (num_edges, 3) periodic shift vectors (float32)
+            cell: (3, 3) unit cell or None (float32)
             batch: (num_atoms,) graph membership indices or None
             num_graphs: number of graphs in the batch (avoids batch.max().item())
 
         Returns:
-            dict with 'energy', 'node_energy', 'forces'
+            dict with 'energy', 'node_energy' (+ 'interaction_energy' for
+            ScaleShiftMACE)
         """
         num_atoms = positions.shape[0]
         if batch is None:
@@ -375,142 +468,19 @@ class MACE(nn.Module):
 
         # stop_gradient on inputs that don't depend on positions —
         # prevents autograd from tracking unnecessary computation branches
-        node_attrs = mx.stop_gradient(node_attrs)
         shifts = mx.stop_gradient(shifts)
         if cell is not None:
             cell = mx.stop_gradient(cell)
 
-        # 1. Edge vectors and lengths
+        # Edge vectors and lengths — always float32 (see module docstring)
         vectors, lengths = get_edge_vectors_and_lengths(
             positions, edge_index, shifts, cell
         )
 
-        # 2. Atomic energies (baseline, position-independent)
-        node_e0 = self._e0_select_head(
-            self.atomic_energies_fn(node_attrs)
+        energy, node_energy, extra = self._forward_core(
+            vectors, lengths, node_attrs, edge_index, batch, num_graphs
         )
-
-        # 3. Node embedding
-        node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
-
-        # 4. Spherical harmonics (rotate to e3nn basis)
-        edge_attrs = spherical_harmonics(
-            self.max_ell, vectors, normalize=True, normalization="component"
-        )
-        edge_attrs = edge_attrs @ self._sh_rotation
-
-        # 5. Radial embedding
-        edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
-
-        # 6. Interaction loop
-        node_energies_list = [node_e0]
-        node_feats_list = []
-
-        for i in range(self.num_interactions):
-            node_feats, sc = self.interactions[i](
-                node_feats, node_attrs, edge_attrs, edge_feats, edge_index,
-                cutoff=cutoff,
-            )
-            node_feats = self.products[i](node_feats, node_attrs, sc=sc)
-            node_feats_list.append(node_feats)
-
-        # 7. Readouts
-        for i, readout in enumerate(self.readouts):
-            feat_idx = -1 if len(self.readouts) == 1 else i
-            if hasattr(readout, '_num_heads') and readout._num_heads > 1:
-                raw = readout(node_feats_list[feat_idx], head_idx=self._head_idx)
-            else:
-                raw = readout(node_feats_list[feat_idx])
-            node_es = self._readout_select_head(raw)
-            node_energies_list.append(node_es)
-
-        # 8. Accumulate energies (float32 upcast for numerical stability)
-        node_energy = mx.stack(
-            [e.astype(mx.float32) for e in node_energies_list], axis=0
-        ).sum(axis=0)
-
-        energy = scatter_sum(
-            node_energy[:, None], batch, num_graphs
-        ).squeeze(-1)
-
-        return {
-            "energy": energy,
-            "node_energy": node_energy,
-        }
-
-    def _forward_from_vectors(
-        self,
-        vectors: mx.array,
-        lengths: mx.array,
-        node_attrs: mx.array,
-        edge_index: mx.array,
-        batch: mx.array,
-        num_graphs: int = 1,
-    ) -> mx.array:
-        """Compute total energy from pre-computed edge vectors and lengths.
-
-        Used by the calculator for stress computation where vectors/lengths
-        already incorporate strain and must remain differentiable.
-
-        Args:
-            vectors: (num_edges, 3) edge displacement vectors
-            lengths: (num_edges, 1) edge distances
-            node_attrs: (num_atoms, num_elements) one-hot encoding
-            edge_index: (2, num_edges)
-            batch: (num_atoms,) graph membership
-            num_graphs: number of graphs
-
-        Returns:
-            Scalar total energy.
-        """
-        node_attrs = mx.stop_gradient(node_attrs)
-
-        # Atomic energies (baseline)
-        node_e0 = self._e0_select_head(self.atomic_energies_fn(node_attrs))
-
-        # Node embedding
-        node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
-
-        # Spherical harmonics (rotate to e3nn basis)
-        edge_attrs = spherical_harmonics(
-            self.max_ell, vectors, normalize=True, normalization="component"
-        )
-        edge_attrs = edge_attrs @ self._sh_rotation
-
-        # Radial embedding
-        edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
-
-        # Interaction loop
-        node_energies_list = [node_e0]
-        node_feats_list = []
-
-        for i in range(self.num_interactions):
-            node_feats, sc = self.interactions[i](
-                node_feats, node_attrs, edge_attrs, edge_feats, edge_index,
-                cutoff=cutoff,
-            )
-            node_feats = self.products[i](node_feats, node_attrs, sc=sc)
-            node_feats_list.append(node_feats)
-
-        # Readouts
-        for i, readout in enumerate(self.readouts):
-            feat_idx = -1 if len(self.readouts) == 1 else i
-            if hasattr(readout, '_num_heads') and readout._num_heads > 1:
-                raw = readout(node_feats_list[feat_idx], head_idx=self._head_idx)
-            else:
-                raw = readout(node_feats_list[feat_idx])
-            node_es = self._readout_select_head(raw)
-            node_energies_list.append(node_es)
-
-        # Accumulate energies (float32 upcast for numerical stability)
-        node_energy = mx.stack(
-            [e.astype(mx.float32) for e in node_energies_list], axis=0
-        ).sum(axis=0)
-
-        energy = scatter_sum(
-            node_energy[:, None], batch, num_graphs
-        ).squeeze(-1)
-        return energy.sum()
+        return {"energy": energy, "node_energy": node_energy, **extra}
 
     def _forward_from_vectors_with_node_energy(
         self,
@@ -521,74 +491,18 @@ class MACE(nn.Module):
         batch: mx.array,
         num_graphs: int = 1,
     ) -> tuple[mx.array, mx.array]:
-        """Like _forward_from_vectors but also returns node_energy.
+        """Compute total energy from pre-computed edge vectors and lengths.
+
+        Used by the calculator for stress computation where vectors/lengths
+        already incorporate strain and must remain differentiable.
 
         Returns:
             (scalar_energy, node_energy) tuple.
         """
-        node_attrs = mx.stop_gradient(node_attrs)
-
-        # Atomic energies (baseline)
-        node_e0 = self._e0_select_head(self.atomic_energies_fn(node_attrs))
-
-        # Node embedding
-        node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
-
-        # Spherical harmonics (rotate to e3nn basis)
-        edge_attrs = spherical_harmonics(
-            self.max_ell, vectors, normalize=True, normalization="component"
+        energy, node_energy, _ = self._forward_core(
+            vectors, lengths, node_attrs, edge_index, batch, num_graphs
         )
-        edge_attrs = edge_attrs @ self._sh_rotation
-
-        # Radial embedding
-        edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
-
-        # Interaction loop
-        node_energies_list = [node_e0]
-        node_feats_list = []
-
-        for i in range(self.num_interactions):
-            node_feats, sc = self.interactions[i](
-                node_feats, node_attrs, edge_attrs, edge_feats, edge_index,
-                cutoff=cutoff,
-            )
-            node_feats = self.products[i](node_feats, node_attrs, sc=sc)
-            node_feats_list.append(node_feats)
-
-        # Readouts — each produces (num_atoms, num_heads), select active head
-        for i, readout in enumerate(self.readouts):
-            feat_idx = -1 if len(self.readouts) == 1 else i
-            # Pass head_idx to NonLinearReadoutBlock for mask_head
-            if hasattr(readout, '_num_heads') and readout._num_heads > 1:
-                raw = readout(node_feats_list[feat_idx], head_idx=self._head_idx)
-            else:
-                raw = readout(node_feats_list[feat_idx])
-            node_es = self._readout_select_head(raw)  # (num_atoms,)
-            node_energies_list.append(node_es)
-
-        # Accumulate energies (float32 upcast for numerical stability)
-        node_energy = mx.stack(
-            [e.astype(mx.float32) for e in node_energies_list], axis=0
-        ).sum(axis=0)
-
-        energy = scatter_sum(
-            node_energy[:, None], batch, num_graphs
-        ).squeeze(-1)
         return energy.sum(), node_energy
-
-    def energy_fn(
-        self,
-        positions: mx.array,
-        node_attrs: mx.array,
-        edge_index: mx.array,
-        shifts: mx.array,
-        cell: mx.array | None = None,
-        batch: mx.array | None = None,
-        num_graphs: int = 1,
-    ) -> mx.array:
-        """Compute total energy (scalar) for use with mx.grad."""
-        result = self(positions, node_attrs, edge_index, shifts, cell, batch, num_graphs)
-        return result["energy"].sum()
 
 
 class ScaleShiftMACE(MACE):
@@ -597,6 +511,9 @@ class ScaleShiftMACE(MACE):
     The scale and shift are applied to the sum of readout energies
     (excluding the atomic baseline e0):
         interaction_energy = scale * sum(readout_energies) + shift * num_atoms
+
+    When the model has ZBL pair repulsion, the pair energy is included in
+    the scaled sum (matching PyTorch MACE).
 
     For multi-head models, scale and shift can be vectors (one per head).
     """
@@ -630,182 +547,46 @@ class ScaleShiftMACE(MACE):
         idx = self._head_idx if self._head_idx < len(self._shift_list) else 0
         return self._shift_list[idx]
 
-    def _ss_forward_core(
+    def _forward_core(
         self,
+        vectors: mx.array,
+        lengths: mx.array,
         node_attrs: mx.array,
-        node_feats: mx.array,
-        edge_attrs: mx.array,
-        edge_feats: mx.array,
         edge_index: mx.array,
         batch: mx.array,
         num_graphs: int,
-        cutoff: mx.array | None = None,
-    ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
-        """Shared core of ScaleShiftMACE forward pass.
+    ) -> tuple[mx.array, mx.array, dict]:
+        node_attrs = mx.stop_gradient(node_attrs)
 
-        Returns:
-            (node_e0, node_inter_es, total_energy, node_energy, inter_e)
-        """
-        # Atomic energies (baseline, position-independent)
         node_e0 = self._e0_select_head(self.atomic_energies_fn(node_attrs))
+        pair_e = self._pair_energy(lengths, node_attrs, edge_index)
 
-        # Interaction loop
-        node_es_list = []
-        node_feats_list = []
+        edge_attrs, edge_feats, cutoff = self._edge_features(
+            vectors, lengths, node_attrs, edge_index
+        )
+        node_es_list = self._run_layers(
+            node_attrs, edge_attrs, edge_feats, edge_index, cutoff
+        )
 
-        for i in range(self.num_interactions):
-            node_feats, sc = self.interactions[i](
-                node_feats, node_attrs, edge_attrs, edge_feats, edge_index,
-                cutoff=cutoff,
-            )
-            node_feats = self.products[i](node_feats, node_attrs, sc=sc)
-            node_feats_list.append(node_feats)
-
-        # Readouts
-        for i, readout in enumerate(self.readouts):
-            feat_idx = -1 if len(self.readouts) == 1 else i
-            if hasattr(readout, '_num_heads') and readout._num_heads > 1:
-                raw = readout(node_feats_list[feat_idx], head_idx=self._head_idx)
-            else:
-                raw = readout(node_feats_list[feat_idx])
-            node_es = self._readout_select_head(raw)
-            node_es_list.append(node_es)
-
-        # Scale-shift on interaction energies (float32 upcast for numerical stability)
+        # Scale-shift on interaction energies (float32 upcast).
+        # ZBL pair energy is part of the scaled sum (matches PyTorch MACE).
+        scaled_es = ([pair_e] if pair_e is not None else []) + node_es_list
         node_inter_es = mx.stack(
-            [e.astype(mx.float32) for e in node_es_list], axis=0
+            [e.astype(mx.float32) for e in scaled_es], axis=0
         ).sum(axis=0)
         node_inter_es = self.scale_val * node_inter_es + self.shift_val
 
         # Total node energy = e0 + scaled interaction
         node_energy = node_e0.astype(mx.float32) + node_inter_es
-        e0 = scatter_sum(node_e0.astype(mx.float32)[:, None], batch, num_graphs).squeeze(-1)
-
-        # Per-graph energies
-        inter_e = scatter_sum(
+        e0 = graph_sum(
+            node_e0.astype(mx.float32)[:, None], batch, num_graphs
+        ).squeeze(-1)
+        inter_e = graph_sum(
             node_inter_es[:, None], batch, num_graphs
         ).squeeze(-1)
         total_energy = e0 + inter_e
 
-        return node_e0, node_inter_es, total_energy, node_energy, inter_e
-
-    def __call__(
-        self,
-        positions: mx.array,
-        node_attrs: mx.array,
-        edge_index: mx.array,
-        shifts: mx.array,
-        cell: mx.array | None = None,
-        batch: mx.array | None = None,
-        num_graphs: int = 1,
-    ) -> dict:
-        num_atoms = positions.shape[0]
-        if batch is None:
-            batch = mx.zeros(num_atoms, dtype=mx.int32)
-
-        # stop_gradient on inputs that don't depend on positions
-        node_attrs = mx.stop_gradient(node_attrs)
-        shifts = mx.stop_gradient(shifts)
-        if cell is not None:
-            cell = mx.stop_gradient(cell)
-
-        # 1. Edge vectors and lengths
-        vectors, lengths = get_edge_vectors_and_lengths(
-            positions, edge_index, shifts, cell
-        )
-
-        node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
-        edge_attrs = spherical_harmonics(
-            self.max_ell, vectors, normalize=True, normalization="component"
-        )
-        edge_attrs = edge_attrs @ self._sh_rotation
-        edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
-        _, _, energy, node_energy, inter_e = self._ss_forward_core(
-            node_attrs, node_feats, edge_attrs, edge_feats, edge_index,
-            batch, num_graphs, cutoff=cutoff,
-        )
-
-        return {
-            "energy": energy,
-            "node_energy": node_energy,
-            "interaction_energy": inter_e,
-        }
-
-    def _forward_from_vectors(
-        self,
-        vectors: mx.array,
-        lengths: mx.array,
-        node_attrs: mx.array,
-        edge_index: mx.array,
-        batch: mx.array,
-        num_graphs: int = 1,
-    ) -> mx.array:
-        """Compute total energy from pre-computed edge vectors and lengths.
-
-        ScaleShiftMACE variant: applies scale/shift to interaction energies.
-        """
-        node_attrs = mx.stop_gradient(node_attrs)
-
-        # Node embedding
-        node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
-
-        # Spherical harmonics (rotate to e3nn basis)
-        edge_attrs = spherical_harmonics(
-            self.max_ell, vectors, normalize=True, normalization="component"
-        )
-        edge_attrs = edge_attrs @ self._sh_rotation
-
-        # Radial embedding
-        edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
-
-        _, _, total_energy, _, _ = self._ss_forward_core(
-            node_attrs, node_feats, edge_attrs, edge_feats, edge_index, batch, num_graphs,
-            cutoff=cutoff,
-        )
-        return total_energy.sum()
-
-    def _forward_from_vectors_with_node_energy(
-        self,
-        vectors: mx.array,
-        lengths: mx.array,
-        node_attrs: mx.array,
-        edge_index: mx.array,
-        batch: mx.array,
-        num_graphs: int = 1,
-    ) -> tuple[mx.array, mx.array]:
-        """Like _forward_from_vectors but also returns node_energy."""
-        node_attrs = mx.stop_gradient(node_attrs)
-
-        # Node embedding
-        node_feats = mx.stop_gradient(self.node_embedding(node_attrs))
-
-        # Spherical harmonics (rotate to e3nn basis)
-        edge_attrs = spherical_harmonics(
-            self.max_ell, vectors, normalize=True, normalization="component"
-        )
-        edge_attrs = edge_attrs @ self._sh_rotation
-
-        # Radial embedding
-        edge_feats, cutoff = self._embed_radial(lengths, node_attrs, edge_index)
-
-        _, _, total_energy, node_energy, _ = self._ss_forward_core(
-            node_attrs, node_feats, edge_attrs, edge_feats, edge_index, batch, num_graphs,
-            cutoff=cutoff,
-        )
-        return total_energy.sum(), node_energy
-
-    def energy_fn(
-        self,
-        positions: mx.array,
-        node_attrs: mx.array,
-        edge_index: mx.array,
-        shifts: mx.array,
-        cell: mx.array | None = None,
-        batch: mx.array | None = None,
-        num_graphs: int = 1,
-    ) -> mx.array:
-        result = self(positions, node_attrs, edge_index, shifts, cell, batch, num_graphs)
-        return result["energy"].sum()
+        return total_energy, node_energy, {"interaction_energy": inter_e}
 
 
 _DTYPE_MAP = {
@@ -858,6 +639,28 @@ def _convert_private_arrays(model: nn.Module, dtype: mx.Dtype) -> None:
                     module.__dict__[attr_name] = val.astype(dtype)
 
 
+def _pin_float32(model: MACE) -> None:
+    """Re-pin amplitude-sensitive arrays to float32 after a dtype conversion.
+
+    These quantities either carry large absolute magnitudes (atomic baseline
+    energies), feed the float32 geometric front-end (SH rotation, Bessel
+    frequencies, covalent radii), or otherwise must not be quantized.
+    """
+    ae_blk = model.atomic_energies_fn
+    ae_blk.atomic_energies = ae_blk.atomic_energies.astype(mx.float32)
+
+    bessel = model.radial_embedding.bessel_fn
+    bessel.bessel_weights = bessel.bessel_weights.astype(mx.float32)
+
+    if getattr(model.radial_embedding, "_has_transform", False):
+        transform = model.radial_embedding.distance_transform
+        transform._covalent_radii = transform._covalent_radii.astype(mx.float32)
+
+    if model.pair_repulsion_fn is not None:
+        pr = model.pair_repulsion_fn
+        pr._covalent_radii = pr._covalent_radii.astype(mx.float32)
+
+
 def load_model(
     model_dir: str, dtype: str = "float32"
 ) -> MACE | ScaleShiftMACE:
@@ -905,6 +708,8 @@ def load_model(
         model.set_dtype(mx_dtype)
         # Also convert private constant arrays (CG coefficients, U matrices, etc.)
         _convert_private_arrays(model, mx_dtype)
+        # Amplitude-sensitive arrays stay float32 (see module docstring)
+        _pin_float32(model)
 
     # Store z_table and compute dtype on model for calculator use
     if z_table is not None:

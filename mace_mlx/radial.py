@@ -1,7 +1,7 @@
 """Radial basis functions and cutoff envelopes for MACE-MLX.
 
-Implements BesselBasis, GaussianBasis, PolynomialCutoff, RadialEmbeddingBlock,
-and make_radial_mlp — all as MLX nn.Module subclasses.
+Implements BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis,
+RadialEmbeddingBlock, and make_radial_mlp — all as MLX nn.Module subclasses.
 """
 
 from __future__ import annotations
@@ -11,6 +11,27 @@ from typing import Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from mace_mlx.utils import scatter_sum
+
+
+def _polynomial_envelope(u: mx.array, p: int) -> mx.array:
+    """Smooth polynomial envelope on u = r/r_max: 1 at u=0, 0 at u>=1.
+
+    envelope(u) = 1 - C1*u^p + C2*u^(p+1) - C3*u^(p+2)
+    where C1=(p+1)(p+2)/2, C2=p(p+2), C3=p(p+1)/2
+    """
+    pf = float(p)
+    u_p = u ** p
+    u_p1 = u_p * u
+    u_p2 = u_p1 * u
+    envelope = (
+        1.0
+        - ((pf + 1.0) * (pf + 2.0) / 2.0) * u_p
+        + pf * (pf + 2.0) * u_p1
+        - (pf * (pf + 1.0) / 2.0) * u_p2
+    )
+    return envelope * (u < 1.0)
 
 
 class BesselBasis(nn.Module):
@@ -97,24 +118,90 @@ class PolynomialCutoff(nn.Module):
         self.p = p
 
     def __call__(self, x: mx.array) -> mx.array:
-        p = self.p
-        u = x / self.r_max
-        p_float = float(p)
-
-        u_p = u ** p
-        u_p1 = u_p * u
-        u_p2 = u_p1 * u
-
-        envelope = (
-            1.0
-            - ((p_float + 1.0) * (p_float + 2.0) / 2.0) * u_p
-            + p_float * (p_float + 2.0) * u_p1
-            - (p_float * (p_float + 1.0) / 2.0) * u_p2
-        )
-        return envelope * (x < self.r_max)
+        return _polynomial_envelope(x / self.r_max, self.p)
 
     def __repr__(self) -> str:
         return f"PolynomialCutoff(r_max={self.r_max}, p={self.p})"
+
+
+class ZBLBasis(nn.Module):
+    """Ziegler-Biersack-Littmark (ZBL) pair repulsion with polynomial cutoff.
+
+    Matches PyTorch MACE's ZBLBasis: the cutoff envelope uses an edge-wise
+    r_max = covalent_radii[Z_u] + covalent_radii[Z_v], so the repulsion only
+    acts at bonding distances and below. Used by the mpa-0/0b/0b2/0b3 model
+    family (pair_repulsion=True checkpoints).
+
+    All quantities are computed in float32 (part of the geometric front-end).
+    """
+
+    def __init__(
+        self,
+        p: int = 6,
+        a_exp: float = 0.300,
+        a_prefactor: float = 0.4543,
+    ):
+        super().__init__()
+        import ase.data
+
+        self._p = int(p)
+        self._a_exp = float(a_exp)
+        self._a_prefactor = float(a_prefactor)
+        # Universal screening function coefficients (Ziegler et al.)
+        self._c = (0.1818, 0.5099, 0.2802, 0.02817)
+        self._covalent_radii = mx.array(
+            ase.data.covalent_radii.tolist(), dtype=mx.float32
+        )
+
+    def __call__(
+        self,
+        lengths: mx.array,
+        node_attrs: mx.array,
+        edge_index: mx.array,
+        atomic_numbers: mx.array,
+    ) -> mx.array:
+        """
+        Args:
+            lengths: (num_edges, 1) interatomic distances (float32)
+            node_attrs: (num_atoms, num_elements) one-hot encoding
+            edge_index: (2, num_edges) [sender, receiver]
+            atomic_numbers: (num_elements,) atomic number per element index
+
+        Returns:
+            (num_atoms,) per-node ZBL repulsion energy (float32)
+        """
+        sender = edge_index[0]
+        receiver = edge_index[1]
+        node_z = atomic_numbers[mx.argmax(node_attrs, axis=1)]  # (num_atoms,)
+        Z_u = node_z[sender].astype(mx.int32)
+        Z_v = node_z[receiver].astype(mx.int32)
+        Zu_f = Z_u.astype(mx.float32)
+        Zv_f = Z_v.astype(mx.float32)
+
+        r = lengths.squeeze(-1).astype(mx.float32)  # (num_edges,)
+        a = (
+            self._a_prefactor
+            * 0.529
+            / (Zu_f ** self._a_exp + Zv_f ** self._a_exp)
+        )
+        r_over_a = r / a
+        c0, c1, c2, c3 = self._c
+        phi = (
+            c0 * mx.exp(-3.2 * r_over_a)
+            + c1 * mx.exp(-0.9423 * r_over_a)
+            + c2 * mx.exp(-0.4028 * r_over_a)
+            + c3 * mx.exp(-0.2016 * r_over_a)
+        )
+        # e^2 / (4*pi*eps0) = 14.3996 eV*Angstrom
+        v_edges = (14.3996 * Zu_f * Zv_f) / r * phi
+        r_max = self._covalent_radii[Z_u] + self._covalent_radii[Z_v]
+        envelope = _polynomial_envelope(r / r_max, self._p)
+        v_edges = 0.5 * v_edges * envelope
+        v_nodes = scatter_sum(v_edges[:, None], receiver, node_attrs.shape[0])
+        return v_nodes.squeeze(-1)
+
+    def __repr__(self) -> str:
+        return f"ZBLBasis(p={self._p}, a_exp={self._a_exp}, a_prefactor={self._a_prefactor})"
 
 
 class AgnesiTransform(nn.Module):
@@ -168,7 +255,9 @@ class AgnesiTransform(nn.Module):
         Z_v = node_z[receiver].astype(mx.int32)  # (num_edges,)
         r_0 = 0.5 * (self._covalent_radii[Z_u] + self._covalent_radii[Z_v])
         r_0 = r_0[:, None]  # (num_edges, 1)
-        r_over_r_0 = x / r_0
+        # Clamp: the fractional powers below have infinite gradients at 0,
+        # which would NaN the backward pass for zero-length edges.
+        r_over_r_0 = mx.maximum(x / r_0, 1e-12)
         q, p, a = self._q, self._p, self._a
         return 1.0 / (1.0 + a * mx.power(r_over_r_0, q) / (1.0 + mx.power(r_over_r_0, q - p)))
 

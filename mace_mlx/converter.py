@@ -126,6 +126,16 @@ def _load_torch_model(model_path: str):
     """Load PyTorch MACE model from path or download MACE-MP/OFF."""
     import torch
 
+    # MACE-OFF organic models: "off-small" / "off-medium" / "off-large"
+    if model_path.startswith("off-"):
+        from mace.calculators import mace_off
+
+        calc = mace_off(
+            model=model_path[len("off-"):], device="cpu",
+            default_dtype="float32",
+        )
+        return calc.models[0]
+
     # Check if it's a named MACE-MP model
     try:
         from mace.calculators.foundations_models import mace_mp_names
@@ -275,6 +285,17 @@ def _extract_config(model, state_dict: dict) -> dict:
     # block to TP weights and density rather than in the radial embedding.
     if hasattr(model.radial_embedding, "apply_cutoff"):
         config["apply_cutoff"] = bool(model.radial_embedding.apply_cutoff)
+
+    # ZBL pair repulsion (mpa-0/0b/0b2/0b3 family). The screening-function
+    # coefficients are fixed; p / a_exp / a_prefactor come from the checkpoint.
+    if hasattr(model, "pair_repulsion") and model.pair_repulsion:
+        config["pair_repulsion"] = {
+            "p": int(state_dict["pair_repulsion_fn.p"].item()),
+            "a_exp": float(state_dict["pair_repulsion_fn.a_exp"].item()),
+            "a_prefactor": float(
+                state_dict["pair_repulsion_fn.a_prefactor"].item()
+            ),
+        }
 
     return config
 

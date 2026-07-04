@@ -32,6 +32,18 @@ def scatter_sum(src: mx.array, index: mx.array, dim_size: int) -> mx.array:
     return out.at[index].add(src)
 
 
+def graph_sum(src: mx.array, batch: mx.array, num_graphs: int) -> mx.array:
+    """Per-graph reduction of per-node values.
+
+    Equivalent to ``scatter_sum(src, batch, num_graphs)`` but uses a plain
+    (deterministic) sum for the common single-graph case instead of a
+    scatter with N collisions on one output slot.
+    """
+    if num_graphs == 1:
+        return src.sum(axis=0, keepdims=True)
+    return scatter_sum(src, batch, num_graphs)
+
+
 def get_edge_vectors_and_lengths(
     positions: mx.array,
     edge_index: mx.array,
@@ -64,8 +76,11 @@ def get_edge_vectors_and_lengths(
     elif shifts is not None:
         vectors = vectors + shifts
 
-    # Compute lengths
-    lengths = mx.sqrt(mx.sum(vectors * vectors, axis=-1, keepdims=True))
+    # Compute lengths. The clamp keeps the sqrt VJP finite for degenerate
+    # zero-length edges (overlapping atoms) — sqrt'(0) is otherwise inf and
+    # poisons all forces with NaN. No effect on normal geometries.
+    sq = mx.sum(vectors * vectors, axis=-1, keepdims=True)
+    lengths = mx.sqrt(mx.maximum(sq, 1e-24))
     return vectors, lengths
 
 

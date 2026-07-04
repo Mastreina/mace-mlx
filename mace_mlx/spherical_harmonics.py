@@ -69,6 +69,7 @@ def spherical_harmonics(
     vectors: mx.array,
     normalize: bool = True,
     normalization: str = "component",
+    basis: str = "standard",
 ) -> mx.array:
     """Compute real spherical harmonics Y_l^m for l=0..lmax.
 
@@ -87,6 +88,13 @@ def spherical_harmonics(
         ``"component"`` — each component has variance 1 on the sphere,
         i.e. ``||Y_l||^2 = 2l+1``.  This is the MACE / e3nn default.
         ``"norm"`` — ``||Y_l|| = 1`` on the sphere.
+    basis : str
+        ``"standard"`` — standard m-ordering.
+        ``"e3nn"`` — e3nn's basis convention. The e3nn basis differs from
+        the standard one by the proper rotation (x,y,z) -> (y,z,x); since
+        the CG coefficients are rotation-invariant tensors, seeding the
+        recursion with the rotated l=1 block yields the e3nn basis at all
+        l with zero extra work (this replaces a runtime rotation matmul).
 
     Returns
     -------
@@ -97,11 +105,15 @@ def spherical_harmonics(
         raise ValueError(
             f"normalization must be 'component' or 'norm', got '{normalization}'"
         )
+    if basis not in ("standard", "e3nn"):
+        raise ValueError(f"basis must be 'standard' or 'e3nn', got '{basis}'")
 
     # --- normalise input vectors ------------------------------------------
     if normalize:
-        r = mx.sqrt(mx.sum(vectors * vectors, axis=-1, keepdims=True))
-        r = mx.maximum(r, mx.stop_gradient(mx.array(1e-20)))  # avoid division by zero
+        # Clamp inside the sqrt: clamping only the result keeps the forward
+        # finite but sqrt's VJP at 0 is still inf (0 * inf = NaN in backward).
+        sq = mx.sum(vectors * vectors, axis=-1, keepdims=True)
+        r = mx.sqrt(mx.maximum(sq, 1e-24))
         unit = vectors / r
     else:
         unit = vectors
@@ -118,9 +130,14 @@ def spherical_harmonics(
     if lmax == 0:
         return _apply_norm(mx.concatenate(Y_blocks, axis=-1), lmax, normalization)
 
-    # --- l = 1 (standard m-ordering: m=-1 -> y, m=0 -> z, m=+1 -> x) -----
+    # --- l = 1 seed --------------------------------------------------------
+    # standard m-ordering: (m=-1, 0, +1) -> (y, z, x)
+    # e3nn ordering:       (x, y, z)
     sqrt3 = math.sqrt(3.0)
-    Y1 = mx.stack([sqrt3 * y, sqrt3 * z, sqrt3 * x], axis=-1)  # (..., 3)
+    if basis == "e3nn":
+        Y1 = mx.stack([sqrt3 * x, sqrt3 * y, sqrt3 * z], axis=-1)  # (..., 3)
+    else:
+        Y1 = mx.stack([sqrt3 * y, sqrt3 * z, sqrt3 * x], axis=-1)  # (..., 3)
     Y_blocks.append(Y1)
 
     if lmax == 1:

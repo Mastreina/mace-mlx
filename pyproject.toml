@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mace-mlx"
-version = "0.2.0"
+version = "0.3.0"
 description = "GPU-accelerated MACE interatomic potential inference on Apple Silicon via MLX"
 readme = "README.md"
 license = "MIT"
@@ -22,7 +22,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "mlx>=0.22.0",
+    # 0.31.2 floor: value_and_grad long-run leak fix (#3290), compile
+    # fusion correctness (#3166/#3427), gather_mm vjp (>=0.27.1)
+    "mlx>=0.31.2",
     "numpy>=1.24.0",
     "scipy>=1.10.0",
     "ase>=3.22.0",
@@ -30,6 +32,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Needed once per named model to download + convert the PyTorch checkpoint
+# (the converted result is cached under ~/.cache/mace_mlx).
+convert = [
+    "mace-torch>=0.3.0",
+    "torch>=2.0",
+]
 test = [
     "pytest>=7.0",
     "mace-torch>=0.3.0",

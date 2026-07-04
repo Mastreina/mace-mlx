@@ -16,37 +16,7 @@ from mace_mlx.irreps import Irrep, Irreps, MulIr
 from mace_mlx.linear import EquivariantLinear
 from mace_mlx.radial import make_radial_mlp, make_radial_mlp_with_layernorm
 from mace_mlx.tensor_product import FullyConnectedTensorProduct, TensorProduct
-from mace_mlx.kernels import gather_tp_scatter
 from mace_mlx.utils import SILU_NORM_FACTOR, scatter_sum, tp_out_irreps_with_instructions
-
-
-def _can_fuse_scalar_tp(tp: TensorProduct) -> bool:
-    """Check if a TensorProduct can use the fused gather-TP-scatter kernel.
-
-    The fused kernel applies when:
-    - There is exactly one instruction
-    - The instruction uses "uvu" mode with external weights
-    - All irreps dimensions are 1 (scalar, l=0)
-    - CG coefficient is a scalar (identity fast-path)
-    - path_weight is 1.0
-
-    These conditions hold for MACE's conv_tp when hidden_irreps = Nx0e
-    and irreps_sh starts with "0e" (the 0e component couples 0e x 0e -> 0e).
-    """
-    if len(tp._instructions) != 1:
-        return False
-    inst = tp._instructions[0]
-    if inst.connection_mode != "uvu":
-        return False
-    if inst.ir1_dim != 1 or inst.ir2_dim != 1 or inst.ir_out_dim != 1:
-        return False
-    if tp._cg_scalars[0] is None or abs(tp._cg_scalars[0] - 1.0) > 1e-6:
-        return False
-    if abs(inst.path_weight - 1.0) > 1e-6:
-        return False
-    if inst.mul2 != 1:
-        return False
-    return True
 
 
 class LinearNodeEmbeddingBlock(nn.Module):
@@ -87,7 +57,12 @@ class AtomicEnergiesBlock(nn.Module):
         Returns:
             (num_atoms,) or (num_atoms, num_heads) baseline energy per atom
         """
-        return x @ mx.atleast_2d(self.atomic_energies).T
+        ae = mx.atleast_2d(self.atomic_energies)
+        # Baseline energies carry large magnitudes (tens of eV) — always
+        # contract in their own (float32) precision, even in fp16 mode.
+        if x.dtype != ae.dtype:
+            x = x.astype(ae.dtype)
+        return x @ ae.T
 
 
 class RealAgnosticInteractionBlock(nn.Module):
@@ -125,8 +100,8 @@ class RealAgnosticInteractionBlock(nn.Module):
         self.linear_up = EquivariantLinear(self.irreps_in, self.irreps_in)
 
         # 2. conv_tp: tensor product with edge spherical harmonics
-        #    Pre-rotate CG coefficients to absorb the SH basis rotation,
-        #    so SH can be passed in standard m-ordering without runtime rotation.
+        #    (the SH arrive already in the e3nn basis — the basis change is
+        #    folded into the SH recursion seed, see spherical_harmonics.py)
         irreps_mid, instructions = tp_out_irreps_with_instructions(
             self.irreps_in, irreps_sh, self.irreps_out
         )
@@ -154,18 +129,6 @@ class RealAgnosticInteractionBlock(nn.Module):
             self.irreps_out, node_attrs_irreps, self.irreps_out
         )
 
-        # Detect scalar-only TP for fused kernel fast path
-        self._can_fuse = _can_fuse_scalar_tp(self.conv_tp)
-        self._use_fused_kernel = False
-
-    def set_fused_kernel(self, enabled: bool = True) -> None:
-        """Enable/disable the fused Metal gather-TP-scatter kernel.
-
-        Only effective for scalar-only TP (hidden_irreps = Nx0e).
-        The Metal kernel has no autograd support, so this should only
-        be enabled during inference.
-        """
-        self._use_fused_kernel = enabled and self._can_fuse
 
     def __call__(
         self,
@@ -201,17 +164,8 @@ class RealAgnosticInteractionBlock(nn.Module):
             tp_weights = tp_weights * cutoff
 
         # 3-4. Message computation + aggregation
-        if self._use_fused_kernel:
-            # Fused gather-TP-scatter (pure MLX, autograd-compatible)
-            message = gather_tp_scatter(
-                node_feats_up, tp_weights, edge_attrs[:, 0],
-                sender, receiver, num_nodes,
-                use_metal=False,
-            )
-        else:
-            # Standard path: gather -> TP -> scatter
-            mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
-            message = scatter_sum(mji, receiver, num_nodes)
+        mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
+        message = scatter_sum(mji, receiver, num_nodes)
 
         # 5. Contract
         message = self.linear(message) / self.avg_num_neighbors
@@ -261,7 +215,7 @@ class RealAgnosticResidualInteractionBlock(nn.Module):
         # 1. linear_up
         self.linear_up = EquivariantLinear(self.irreps_in, self.irreps_in)
 
-        # 2. conv_tp — CG coefficients pre-rotated to absorb SH basis rotation
+        # 2. conv_tp (SH arrive already in the e3nn basis)
         irreps_mid, instructions = tp_out_irreps_with_instructions(
             self.irreps_in, irreps_sh, self.irreps_out
         )
@@ -284,18 +238,6 @@ class RealAgnosticResidualInteractionBlock(nn.Module):
         # 4. linear
         self.linear = EquivariantLinear(irreps_mid, self.irreps_out)
 
-        # Detect scalar-only TP for fused kernel fast path
-        self._can_fuse = _can_fuse_scalar_tp(self.conv_tp)
-        self._use_fused_kernel = False
-
-    def set_fused_kernel(self, enabled: bool = True) -> None:
-        """Enable/disable the fused Metal gather-TP-scatter kernel.
-
-        Only effective for scalar-only TP (hidden_irreps = Nx0e).
-        The Metal kernel has no autograd support, so this should only
-        be enabled during inference.
-        """
-        self._use_fused_kernel = enabled and self._can_fuse
 
     def __call__(
         self,
@@ -328,17 +270,8 @@ class RealAgnosticResidualInteractionBlock(nn.Module):
             tp_weights = tp_weights * cutoff
 
         # 3-4. Message computation + aggregation
-        if self._use_fused_kernel:
-            # Fused gather-TP-scatter (pure MLX, autograd-compatible)
-            message = gather_tp_scatter(
-                node_feats_up, tp_weights, edge_attrs[:, 0],
-                sender, receiver, num_nodes,
-                use_metal=False,
-            )
-        else:
-            # Standard path: gather -> TP -> scatter
-            mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
-            message = scatter_sum(mji, receiver, num_nodes)
+        mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
+        message = scatter_sum(mji, receiver, num_nodes)
 
         # 5. Contract
         message = self.linear(message) / self.avg_num_neighbors
@@ -410,13 +343,6 @@ class RealAgnosticDensityInteractionBlock(nn.Module):
             self.irreps_out, node_attrs_irreps, self.irreps_out
         )
 
-        # Fused kernel detection
-        self._can_fuse = _can_fuse_scalar_tp(self.conv_tp)
-        self._use_fused_kernel = False
-
-    def set_fused_kernel(self, enabled: bool = True) -> None:
-        """Enable/disable the fused Metal gather-TP-scatter kernel."""
-        self._use_fused_kernel = enabled and self._can_fuse
 
     def __call__(
         self,
@@ -446,15 +372,8 @@ class RealAgnosticDensityInteractionBlock(nn.Module):
         density = scatter_sum(edge_density, receiver, num_nodes)  # (N_nodes, 1)
 
         # 4. Message computation + aggregation
-        if self._use_fused_kernel:
-            message = gather_tp_scatter(
-                node_feats_up, tp_weights, edge_attrs[:, 0],
-                sender, receiver, num_nodes,
-                use_metal=False,
-            )
-        else:
-            mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
-            message = scatter_sum(mji, receiver, num_nodes)
+        mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
+        message = scatter_sum(mji, receiver, num_nodes)
 
         # 5. Contract with density normalization
         message = self.linear(message) / (density + 1)
@@ -530,13 +449,6 @@ class RealAgnosticDensityResidualInteractionBlock(nn.Module):
         # 5. linear
         self.linear = EquivariantLinear(irreps_mid, self.irreps_out)
 
-        # Fused kernel detection
-        self._can_fuse = _can_fuse_scalar_tp(self.conv_tp)
-        self._use_fused_kernel = False
-
-    def set_fused_kernel(self, enabled: bool = True) -> None:
-        """Enable/disable the fused Metal gather-TP-scatter kernel."""
-        self._use_fused_kernel = enabled and self._can_fuse
 
     def __call__(
         self,
@@ -569,15 +481,8 @@ class RealAgnosticDensityResidualInteractionBlock(nn.Module):
         density = scatter_sum(edge_density, receiver, num_nodes)  # (N_nodes, 1)
 
         # 4. Message computation + aggregation
-        if self._use_fused_kernel:
-            message = gather_tp_scatter(
-                node_feats_up, tp_weights, edge_attrs[:, 0],
-                sender, receiver, num_nodes,
-                use_metal=False,
-            )
-        else:
-            mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
-            message = scatter_sum(mji, receiver, num_nodes)
+        mji = self.conv_tp(node_feats_up[sender], edge_attrs, tp_weights)
+        message = scatter_sum(mji, receiver, num_nodes)
 
         # 5. Contract with density normalization
         message = self.linear(message) / (density + 1)
