@@ -1,6 +1,8 @@
-# MACE-MLX
+# mace-mlx
 
-Drop-in MLX replacement for [MACE](https://github.com/ACEsuit/mace) on Apple Silicon. **2-4x faster** than PyTorch CPU.
+Drop-in MLX replacement for [MACE](https://github.com/ACEsuit/mace) on Apple Silicon. 
+
+Fully optimized by `claude-fable-5`.
 
 ## Install
 
